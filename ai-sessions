@@ -598,11 +598,15 @@ def main(argv=None):
                         help="only this backend")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable output")
-    parser.add_argument("command", nargs="?", default="list",
+    parser.add_argument("command", nargs="?", default=None,
                         choices=["list", "pick", "crashed"],
-                        help="list (default), pick (fzf + resume), "
+                        help="pick (fzf + resume; default on a terminal), "
+                             "list (table; default when piped), "
                              "crashed (sessions open at last shutdown)")
     args = parser.parse_args(argv)
+    if args.command is None:
+        interactive = sys.stdout.isatty() and not args.json
+        args.command = "pick" if interactive else "list"
     args.crashed_only = args.command == "crashed"
 
     if args.command == "pick":

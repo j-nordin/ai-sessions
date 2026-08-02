@@ -16,8 +16,13 @@ The backend layer is pluggable, so other AI CLIs can be added later
 
 ## Usage
 
+Running `ai-sessions` on a terminal opens an interactive picker over your
+recent sessions — select one and it resumes in its original project
+directory. When output is piped (or with `--json`), it prints the table
+instead, same as `ai-sessions list`:
+
 ```console
-$ ai-sessions
+$ ai-sessions list
    LAST ACTIVE  PROJECT               TITLE                            ID
  ● 5m ago      ~/work/my-project     Fix flaky integration test       3f9f264f
  ✗ 2h ago      ~/dotfiles            Refactor install script          6b42ce33
@@ -32,7 +37,6 @@ $ ai-sessions
 
 ```console
 $ ai-sessions crashed        # only the sessions left open at the last shutdown
-$ ai-sessions pick           # fzf picker → resumes the chosen session in its project dir
 $ ai-sessions --here         # only sessions under the current directory
 $ ai-sessions --project ~/work/my-project
 $ ai-sessions -n 50          # show more rows
