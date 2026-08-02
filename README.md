@@ -35,8 +35,24 @@ $ ai-sessions list
 - `✗` (yellow) — session was still open when the machine went down or the
   process died; it never exited cleanly
 
+Full-text search finds the session where something was discussed — on a
+terminal the results open in the picker, piped they print with snippets:
+
+```console
+$ ai-sessions search "flaky test" | cat
+   LAST ACTIVE  PROJECT               TITLE                        MATCHES  ID
+ ✗ 2h ago      ~/work/my-project     Fix flaky integration test   12       3f9f264f
+     …the flaky test only fails when the cache is cold…
+```
+
+By default search matches conversation text (your prompts, the assistant's
+replies, session titles). Add `--everything` to also match tool output —
+command results and file contents — for "which session touched this
+host/file?" hunts.
+
 ```console
 $ ai-sessions crashed        # only the sessions left open at the last shutdown
+$ ai-sessions search <text>  # find sessions by content, then resume one
 $ ai-sessions --here         # only sessions under the current directory
 $ ai-sessions --project ~/work/my-project
 $ ai-sessions -n 50          # show more rows
@@ -79,6 +95,10 @@ of currently running sessions in `~/.claude/sessions/<pid>.json`.
   after the stale entry, the session was since resumed and is not flagged.
 - Only bounded head/tail reads are performed per transcript, so listing stays
   fast even with multi-hundred-MB transcripts.
+- **Search** needs no index: a `grep -liF` pass narrows to candidate
+  transcripts, which are then streamed line by line to match only
+  conversation text (or everything, with `--everything`). Case-insensitive
+  fixed-string matching.
 
 Everything is read-only: `ai-sessions` never writes to the backend's data
 directories. Set `CLAUDE_DIR` to point the claude backend at a different

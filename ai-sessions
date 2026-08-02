@@ -49,6 +49,9 @@ class Session:
     last_active: float | None
     status: str = STATUS_CLOSED
     has_messages: bool = True
+    transcript_path: str = ""
+    match_count: int = 0
+    snippet: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -65,6 +68,11 @@ class Backend:
         raise NotImplementedError
 
     def resume_argv(self, session: Session) -> list[str]:
+        raise NotImplementedError
+
+    def searchable_text(self, obj: dict) -> str | None:
+        """Conversation text of one transcript line, or None if the line
+        is not conversation (metadata, tool output, ...)."""
         raise NotImplementedError
 
 
@@ -182,7 +190,30 @@ class ClaudeBackend(Backend):
             created=created,
             last_active=last_active,
             has_messages=has_messages,
+            transcript_path=str(path),
         )
+
+    def searchable_text(self, obj: dict) -> str | None:
+        kind = obj.get("type")
+        if kind == "ai-title":
+            return obj.get("aiTitle")
+        if kind == "last-prompt":
+            return obj.get("lastPrompt")
+        if kind not in ("user", "assistant"):
+            return None
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Tool results come back as user-role lines with tool_result
+            # blocks — that's tool output, not conversation.
+            texts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return "\n".join(t for t in texts if t) or None
+        return None
 
     @staticmethod
     def _collect_meta(obj: dict, meta: dict):
@@ -392,6 +423,71 @@ def _truncate(text: str, width: int) -> str:
     return text[: width - 1] + "…"
 
 
+def _make_snippet(text: str, query: str, width: int = 70) -> str:
+    text = _clean_text(text)
+    idx = text.lower().find(query.lower())
+    if idx < 0:
+        return _truncate(text, width)
+    start = max(0, idx - max(0, (width - len(query)) // 2))
+    end = min(len(text), start + width)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def _grep_candidates(query: str, paths: list[str]) -> list[str]:
+    """Cheap first pass: files that contain the query anywhere at all."""
+    if not paths:
+        return []
+    try:
+        result = subprocess.run(
+            ["grep", "-l", "-i", "-F", "--", query, *paths],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return paths  # no grep available — scan everything in Python
+    if result.returncode > 1:
+        return paths  # grep error — fall back to full scan
+    return [p for p in result.stdout.splitlines() if p]
+
+
+def run_search(sessions: list[Session], query: str, everything: bool) -> list[Session]:
+    q = query.lower()
+    by_path = {s.transcript_path: s for s in sessions if s.transcript_path}
+    results = []
+    for path in _grep_candidates(query, list(by_path)):
+        session = by_path.get(path)
+        if session is None:
+            continue
+        backend = BACKENDS[session.backend]
+        count = 0
+        snippet = ""
+        try:
+            with open(path, errors="replace") as fh:
+                for line in fh:
+                    if q not in line.lower():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        obj = None
+                    text = backend.searchable_text(obj) if isinstance(obj, dict) else None
+                    if text and q in text.lower():
+                        count += 1
+                        if not snippet:
+                            snippet = _make_snippet(text, query)
+                    elif everything:
+                        count += 1
+        except OSError:
+            continue
+        if count:
+            session.match_count = count
+            session.snippet = snippet or "(match in tool output)"
+            results.append(session)
+    results.sort(key=lambda s: s.last_active or 0, reverse=True)
+    return results
+
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -422,14 +518,17 @@ def gather(args) -> list[Session]:
     return sessions
 
 
-def render_rows(sessions: list[Session], color: bool) -> list[str]:
+def render_rows(sessions: list[Session], color: bool, show_matches: bool = False) -> list[str]:
     term_width = shutil.get_terminal_size((120, 24)).columns
     project_w = 24
     id_w = 8
     time_w = 11
+    matches_w = 7 if show_matches else 0
     show_backend = len({s.backend for s in sessions}) > 1
     backend_w = 8 if show_backend else 0
-    fixed = 2 + time_w + 2 + project_w + 2 + id_w + (backend_w + 2 if show_backend else 0) + 2
+    fixed = (2 + time_w + 2 + project_w + 2 + id_w + 2
+             + (backend_w + 2 if show_backend else 0)
+             + (matches_w + 2 if show_matches else 0))
     title_w = max(20, min(term_width - fixed, 60))
 
     def paint(text, code):
@@ -441,6 +540,7 @@ def render_rows(sessions: list[Session], color: bool) -> list[str]:
         + ("BACKEND".ljust(backend_w + 2) if show_backend else "")
         + "PROJECT".ljust(project_w + 2)
         + "TITLE".ljust(title_w + 2)
+        + ("MATCHES".ljust(matches_w + 2) if show_matches else "")
         + "ID"
     )
     rows = [paint(header, DIM)]
@@ -457,12 +557,23 @@ def render_rows(sessions: list[Session], color: bool) -> list[str]:
             + ((s.backend.ljust(backend_w + 2)) if show_backend else "")
             + _short_path(s.cwd or "?", project_w).ljust(project_w + 2)
             + _truncate(s.title or "(no title)", title_w).ljust(title_w + 2)
+            + (str(s.match_count).ljust(matches_w + 2) if show_matches else "")
             + s.session_id[:id_w]
         )
         if s.status == STATUS_CRASHED and color:
             line = f"{YELLOW}{line}{NC}"
         rows.append(line)
     return rows
+
+
+def render_snippet(session: Session, query: str, color: bool, width: int) -> str:
+    snippet = _truncate(session.snippet, width)
+    if not color:
+        return snippet
+    # highlight the query inside the dimmed snippet
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    lit = pattern.sub(lambda m: f"{NC}{YELLOW}{m.group(0)}{NC}{DIM}", snippet)
+    return f"{DIM}{lit}{NC}"
 
 
 def cmd_list(args):
@@ -504,20 +615,10 @@ def cmd_crashed(args):
     return 0
 
 
-def cmd_pick(args):
-    sessions = gather(args)
-    if args.crashed_only:
-        sessions = [s for s in sessions if s.status == STATUS_CRASHED]
-    sessions = sessions[: args.limit]
-    if not sessions:
-        print("no sessions found", file=sys.stderr)
-        return 1
-
-    rows = render_rows(sessions, color=True)[1:]  # skip header
+def choose_and_resume(sessions: list[Session], rows: list[str]) -> int:
     chosen = _fzf_choose(sessions, rows) or _prompt_choose(sessions, rows)
     if chosen is None:
         return 1
-
     backend = BACKENDS[chosen.backend]
     cwd = chosen.cwd if chosen.cwd and os.path.isdir(chosen.cwd) else str(Path.home())
     os.chdir(cwd)
@@ -527,6 +628,53 @@ def cmd_pick(args):
     except OSError as exc:
         print(f"error: could not run {argv[0]}: {exc}", file=sys.stderr)
         return 1
+
+
+def cmd_pick(args):
+    sessions = gather(args)
+    if args.crashed_only:
+        sessions = [s for s in sessions if s.status == STATUS_CRASHED]
+    sessions = sessions[: args.limit]
+    if not sessions:
+        print("no sessions found", file=sys.stderr)
+        return 1
+    rows = render_rows(sessions, color=True)[1:]  # skip header
+    return choose_and_resume(sessions, rows)
+
+
+def cmd_search(args):
+    sessions = gather(args)
+    results = run_search(sessions, args.query, args.everything)
+    if args.json:
+        out = []
+        for s in results[: args.limit]:
+            record = _session_json(s)
+            record["match_count"] = s.match_count
+            record["snippet"] = s.snippet
+            out.append(record)
+        print(json.dumps(out, indent=2))
+        return 0
+    if not results:
+        print(f"no sessions match {args.query!r}"
+              + ("" if args.everything else " — try --everything to include tool output"))
+        return 1
+    results = results[: args.limit]
+
+    if sys.stdout.isatty():
+        rows = render_rows(results, color=True, show_matches=True)[1:]
+        rows = [
+            row + "  " + render_snippet(s, args.query, color=True, width=60)
+            for row, s in zip(rows, results)
+        ]
+        return choose_and_resume(results, rows)
+
+    color = False
+    rows = render_rows(results, color, show_matches=True)
+    print(rows[0])
+    for row, s in zip(rows[1:], results):
+        print(row)
+        print("     " + render_snippet(s, args.query, color, width=100))
+    return 0
 
 
 def _fzf_choose(sessions, rows) -> Session | None:
@@ -598,21 +746,34 @@ def main(argv=None):
                         help="only this backend")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable output")
+    parser.add_argument("--everything", action="store_true",
+                        help="search: also match tool output "
+                             "(command results, file contents)")
     parser.add_argument("command", nargs="?", default=None,
-                        choices=["list", "pick", "crashed"],
+                        choices=["list", "pick", "crashed", "search"],
                         help="pick (fzf + resume; default on a terminal), "
                              "list (table; default when piped), "
-                             "crashed (sessions open at last shutdown)")
+                             "crashed (sessions open at last shutdown), "
+                             "search <query> (full-text search + resume)")
+    parser.add_argument("query", nargs="?",
+                        help="text to search for (search command only)")
     args = parser.parse_args(argv)
     if args.command is None:
         interactive = sys.stdout.isatty() and not args.json
         args.command = "pick" if interactive else "list"
+    if args.command == "search" and not args.query:
+        parser.error("search requires a query, e.g.: ai-sessions search kgateway")
+    if args.command != "search" and args.query:
+        parser.error(f"unexpected argument {args.query!r} "
+                     f"(did you mean: ai-sessions search {args.query}?)")
     args.crashed_only = args.command == "crashed"
 
     if args.command == "pick":
         return cmd_pick(args)
     if args.command == "crashed":
         return cmd_crashed(args)
+    if args.command == "search":
+        return cmd_search(args)
     return cmd_list(args)
 
 
