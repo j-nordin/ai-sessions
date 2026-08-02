@@ -47,7 +47,7 @@ working directory and execs the backend's resume command
 ## Install
 
 ```console
-$ git clone https://github.com/<user>/ai-sessions
+$ git clone https://github.com/j-nordin/ai-sessions
 $ cd ai-sessions
 $ ./install.sh    # symlinks the script into ~/.local/bin
 ```
