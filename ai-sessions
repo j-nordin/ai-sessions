@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""ai-sessions — overview and recovery of AI CLI coding sessions.
+
+Lists recent sessions across all projects with titles and last-activity
+times, flags sessions that were still open when the machine went down,
+and resumes a chosen session via fzf.
+
+Backends are pluggable; currently implemented: claude (Claude Code).
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+STATUS_RUNNING = "running"
+STATUS_CRASHED = "crashed"  # was open when the machine/process died uncleanly
+STATUS_CLOSED = "closed"
+
+HEAD_BYTES = 8 * 1024
+TAIL_BYTES = 64 * 1024
+TAIL_BYTES_MAX = 1024 * 1024
+
+GREEN = "\033[0;32m"
+YELLOW = "\033[0;33m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+NC = "\033[0m"
+
+
+@dataclass
+class Session:
+    backend: str
+    session_id: str
+    cwd: str
+    title: str
+    created: float | None  # epoch seconds
+    last_active: float | None
+    status: str = STATUS_CLOSED
+    has_messages: bool = True
+
+
+# --------------------------------------------------------------------------
+# Backend framework
+# --------------------------------------------------------------------------
+
+
+class Backend:
+    """A source of AI CLI sessions. Subclass per tool."""
+
+    name = "?"
+
+    def discover(self) -> list[Session]:
+        raise NotImplementedError
+
+    def resume_argv(self, session: Session) -> list[str]:
+        raise NotImplementedError
+
+
+# --------------------------------------------------------------------------
+# Claude Code backend
+# --------------------------------------------------------------------------
+
+
+class ClaudeBackend(Backend):
+    """Reads Claude Code session transcripts and its live-process registry.
+
+    Data layout (Claude Code >= 2.x):
+      ~/.claude/projects/<dir>/<uuid>.jsonl   one transcript per session
+      ~/.claude/sessions/<pid>.json           registry of running sessions
+
+    Transcript notes:
+      - message lines carry an ISO `timestamp` and the session `cwd`
+      - metadata lines (`ai-title`, `agent-name`, `last-prompt`) carry no
+        timestamp and are rewritten in place long after the last message,
+        so file mtime overstates the last interaction — the last line
+        *with* a timestamp is the real last activity
+      - subagent transcripts live in subdirectories and are excluded by
+        only globbing depth-1 UUID-named files
+    """
+
+    name = "claude"
+
+    def __init__(self):
+        self.claude_dir = Path(
+            os.environ.get("CLAUDE_DIR", "~/.claude")
+        ).expanduser()
+
+    def resume_argv(self, session: Session) -> list[str]:
+        return ["claude", "--resume", session.session_id]
+
+    def discover(self) -> list[Session]:
+        sessions = []
+        for transcript in self._transcripts():
+            try:
+                session = self._parse_transcript(transcript)
+            except OSError:
+                continue
+            if session:
+                sessions.append(session)
+        self._apply_registry(sessions)
+        return sessions
+
+    def _transcripts(self):
+        projects = self.claude_dir / "projects"
+        if not projects.is_dir():
+            return
+        try:
+            project_dirs = sorted(projects.iterdir())
+        except OSError:
+            return
+        for project_dir in project_dirs:
+            try:
+                entries = sorted(project_dir.iterdir())
+            except OSError:
+                continue  # e.g. root-owned dir from a devcontainer
+            for entry in entries:
+                if entry.suffix == ".jsonl" and UUID_RE.match(entry.stem):
+                    yield entry
+
+    def _parse_transcript(self, path: Path) -> Session | None:
+        session_id = path.stem
+        head_lines = self._read_head(path)
+        tail_lines = self._read_tail(path)
+
+        created = None
+        cwd = ""
+        first_user_text = ""
+        meta = {}  # last-seen ai-title / agent-name / last-prompt
+        has_messages = False
+
+        for obj in head_lines:
+            ts = _parse_ts(obj.get("timestamp"))
+            if created is None and ts is not None:
+                created = ts
+            if not cwd and isinstance(obj.get("cwd"), str):
+                cwd = obj["cwd"]
+            if not first_user_text and obj.get("type") == "user":
+                first_user_text = _message_text(obj)
+            self._collect_meta(obj, meta)
+
+        last_active = None
+        for obj in reversed(tail_lines):
+            ts = _parse_ts(obj.get("timestamp"))
+            if ts is not None:
+                last_active = ts
+                break
+        for obj in tail_lines:
+            self._collect_meta(obj, meta)
+            if obj.get("type") in ("user", "assistant"):
+                has_messages = True
+                if not cwd and isinstance(obj.get("cwd"), str):
+                    cwd = obj["cwd"]
+
+        has_messages = has_messages or created is not None
+        if last_active is None:
+            # Degenerate transcript (e.g. a title line and nothing else).
+            last_active = path.stat().st_mtime
+
+        title = (
+            meta.get("ai-title")
+            or meta.get("agent-name")
+            or meta.get("last-prompt")
+            or first_user_text
+        )
+        return Session(
+            backend=self.name,
+            session_id=session_id,
+            cwd=cwd,
+            title=_clean_text(title),
+            created=created,
+            last_active=last_active,
+            has_messages=has_messages,
+        )
+
+    @staticmethod
+    def _collect_meta(obj: dict, meta: dict):
+        kind = obj.get("type")
+        if kind == "ai-title" and obj.get("aiTitle"):
+            meta["ai-title"] = obj["aiTitle"]
+        elif kind == "agent-name" and obj.get("agentName"):
+            meta["agent-name"] = obj["agentName"]
+        elif kind == "last-prompt" and obj.get("lastPrompt"):
+            meta["last-prompt"] = obj["lastPrompt"]
+
+    @staticmethod
+    def _read_head(path: Path) -> list[dict]:
+        with open(path, "rb") as fh:
+            data = fh.read(HEAD_BYTES)
+            truncated = len(data) == HEAD_BYTES
+        lines = data.decode("utf-8", errors="replace").split("\n")
+        if truncated:
+            lines = lines[:-1]  # drop partial final line
+        return _parse_lines(lines)
+
+    @staticmethod
+    def _read_tail(path: Path) -> list[dict]:
+        size = path.stat().st_size
+        window = TAIL_BYTES
+        while True:
+            with open(path, "rb") as fh:
+                fh.seek(max(0, size - window))
+                data = fh.read()
+            lines = data.decode("utf-8", errors="replace").split("\n")
+            if size > window:
+                lines = lines[1:]  # drop partial first line
+            parsed = _parse_lines(lines)
+            if any(_parse_ts(o.get("timestamp")) for o in parsed):
+                return parsed
+            if window >= size or window >= TAIL_BYTES_MAX:
+                return parsed
+            window = min(window * 4, TAIL_BYTES_MAX)
+
+    def _apply_registry(self, sessions: list[Session]):
+        """Mark sessions as running or crashed from the live-process registry.
+
+        Claude Code writes ~/.claude/sessions/<pid>.json while a session is
+        open and removes it on clean exit. An entry whose pid is gone (or
+        whose last update predates the current boot) means the session never
+        shut down cleanly — it was open when the machine went down.
+        """
+        registry_dir = self.claude_dir / "sessions"
+        if not registry_dir.is_dir():
+            return
+        by_id = {s.session_id: s for s in sessions}
+        boot_time = _boot_time()
+        for entry_path in sorted(registry_dir.glob("*.json")):
+            try:
+                entry = json.loads(entry_path.read_text())
+            except (OSError, ValueError):
+                continue
+            session_id = entry.get("sessionId")
+            if not session_id:
+                continue
+            pid = entry.get("pid")
+            updated_at = (entry.get("updatedAt") or 0) / 1000.0
+            alive = _pid_is_claude(pid) and (
+                boot_time is None or updated_at >= boot_time
+            )
+            session = by_id.get(session_id)
+            if session is None:
+                # Registry entry without a transcript on disk — synthesize a
+                # minimal row so a crashed session is never invisible.
+                session = Session(
+                    backend=self.name,
+                    session_id=session_id,
+                    cwd=entry.get("cwd", ""),
+                    title=_clean_text(entry.get("name", "")),
+                    created=(entry.get("startedAt") or 0) / 1000.0 or None,
+                    last_active=updated_at or None,
+                )
+                sessions.append(session)
+                by_id[session_id] = session
+            if alive:
+                session.status = STATUS_RUNNING
+            elif session.status != STATUS_RUNNING:
+                # If the transcript shows activity clearly after the stale
+                # registry entry, the session was resumed since the crash and
+                # is no longer waiting to be reopened.
+                resumed_since = (
+                    session.last_active is not None
+                    and session.last_active > updated_at + 60
+                )
+                if not resumed_since:
+                    session.status = STATUS_CRASHED
+
+
+BACKENDS: dict[str, Backend] = {b.name: b for b in [ClaudeBackend()]}
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def _parse_lines(lines: list[str]) -> list[dict]:
+    parsed = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            parsed.append(obj)
+    return parsed
+
+
+def _parse_ts(value) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _message_text(obj: dict) -> str:
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "")
+    return ""
+
+
+def _clean_text(text: str) -> str:
+    text = re.sub(r"<[^>]{1,80}>", " ", text or "")  # strip inline tags
+    return " ".join(text.split())
+
+
+def _boot_time() -> float | None:
+    try:
+        with open("/proc/uptime") as fh:
+            return time.time() - float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None  # non-Linux: degrade to pid-liveness only
+
+
+def _pid_is_claude(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return b"claude" in fh.read().lower()
+    except OSError:
+        # Either the pid is gone, or /proc is unavailable (non-Linux) — in
+        # the latter case fall back to a plain liveness check.
+        if not os.path.isdir("/proc"):
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+        return False
+
+
+def _relative_time(ts: float | None) -> str:
+    if ts is None:
+        return "?"
+    delta = time.time() - ts
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 48 * 3600:
+        return f"{int(delta // 3600)}h ago"
+    if delta < 14 * 86400:
+        return f"{int(delta // 86400)}d ago"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def _short_path(path: str, width: int) -> str:
+    home = str(Path.home())
+    if path == home:
+        path = "~"
+    elif path.startswith(home + os.sep):
+        path = "~" + path[len(home):]
+    if len(path) <= width:
+        return path
+    parts = path.split(os.sep)
+    while len(parts) > 2 and len(os.sep.join(parts)) > width - 2:
+        del parts[1 if parts[0] in ("~", "") else 0]
+        result = parts[0] + os.sep + "…" + os.sep + os.sep.join(parts[1:])
+        if len(result) <= width:
+            return result
+    return path[: width - 1] + "…"
+
+
+def _truncate(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def gather(args) -> list[Session]:
+    sessions: list[Session] = []
+    for name, backend in BACKENDS.items():
+        if args.backend and name != args.backend:
+            continue
+        sessions.extend(backend.discover())
+
+    if not args.json:
+        sessions = [s for s in sessions if s.has_messages]
+    if args.here:
+        base = os.getcwd()
+        sessions = [
+            s for s in sessions
+            if s.cwd == base or s.cwd.startswith(base + os.sep)
+        ]
+    if args.project:
+        base = str(Path(args.project).expanduser().resolve())
+        sessions = [
+            s for s in sessions
+            if s.cwd == base or s.cwd.startswith(base + os.sep)
+        ]
+    sessions.sort(key=lambda s: s.last_active or 0, reverse=True)
+    return sessions
+
+
+def render_rows(sessions: list[Session], color: bool) -> list[str]:
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    project_w = 24
+    id_w = 8
+    time_w = 11
+    show_backend = len({s.backend for s in sessions}) > 1
+    backend_w = 8 if show_backend else 0
+    fixed = 2 + time_w + 2 + project_w + 2 + id_w + (backend_w + 2 if show_backend else 0) + 2
+    title_w = max(20, min(term_width - fixed, 60))
+
+    def paint(text, code):
+        return f"{code}{text}{NC}" if color else text
+
+    header = (
+        "   "
+        + "LAST ACTIVE".ljust(time_w + 2)
+        + ("BACKEND".ljust(backend_w + 2) if show_backend else "")
+        + "PROJECT".ljust(project_w + 2)
+        + "TITLE".ljust(title_w + 2)
+        + "ID"
+    )
+    rows = [paint(header, DIM)]
+    for s in sessions:
+        if s.status == STATUS_RUNNING:
+            marker = paint("●", GREEN)
+        elif s.status == STATUS_CRASHED:
+            marker = paint("✗", YELLOW)
+        else:
+            marker = " "
+        line = (
+            f" {marker} "
+            + _relative_time(s.last_active).ljust(time_w + 2)
+            + ((s.backend.ljust(backend_w + 2)) if show_backend else "")
+            + _short_path(s.cwd or "?", project_w).ljust(project_w + 2)
+            + _truncate(s.title or "(no title)", title_w).ljust(title_w + 2)
+            + s.session_id[:id_w]
+        )
+        if s.status == STATUS_CRASHED and color:
+            line = f"{YELLOW}{line}{NC}"
+        rows.append(line)
+    return rows
+
+
+def cmd_list(args):
+    sessions = gather(args)
+    if args.json:
+        print(json.dumps([_session_json(s) for s in sessions[: args.limit]], indent=2))
+        return 0
+    if not sessions:
+        print("no sessions found")
+        return 0
+    color = sys.stdout.isatty()
+    for row in render_rows(sessions[: args.limit], color):
+        print(row)
+    crashed = [s for s in sessions if s.status == STATUS_CRASHED]
+    if crashed and not args.crashed_only:
+        n = len(crashed)
+        plural = "s were" if n > 1 else " was"
+        hint = (
+            f"\n{n} session{plural} open when the machine last went down"
+            f" — 'ai-sessions crashed' to review"
+        )
+        print(f"{YELLOW}{hint}{NC}" if color else hint)
+    return 0
+
+
+def cmd_crashed(args):
+    args.crashed_only = True
+    sessions = [s for s in gather(args) if s.status == STATUS_CRASHED]
+    if args.json:
+        print(json.dumps([_session_json(s) for s in sessions], indent=2))
+        return 0
+    if not sessions:
+        print("no sessions were left open — nothing to recover")
+        return 0
+    color = sys.stdout.isatty()
+    for row in render_rows(sessions, color):
+        print(row)
+    print("\nresume one with: ai-sessions pick")
+    return 0
+
+
+def cmd_pick(args):
+    sessions = gather(args)
+    if args.crashed_only:
+        sessions = [s for s in sessions if s.status == STATUS_CRASHED]
+    sessions = sessions[: args.limit]
+    if not sessions:
+        print("no sessions found", file=sys.stderr)
+        return 1
+
+    rows = render_rows(sessions, color=True)[1:]  # skip header
+    chosen = _fzf_choose(sessions, rows) or _prompt_choose(sessions, rows)
+    if chosen is None:
+        return 1
+
+    backend = BACKENDS[chosen.backend]
+    cwd = chosen.cwd if chosen.cwd and os.path.isdir(chosen.cwd) else str(Path.home())
+    os.chdir(cwd)
+    argv = backend.resume_argv(chosen)
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as exc:
+        print(f"error: could not run {argv[0]}: {exc}", file=sys.stderr)
+        return 1
+
+
+def _fzf_choose(sessions, rows) -> Session | None:
+    if not shutil.which("fzf"):
+        return None
+    feed = "\n".join(f"{i}\t{row}" for i, row in enumerate(rows))
+    try:
+        result = subprocess.run(
+            [
+                "fzf", "--ansi", "--delimiter=\t", "--with-nth=2..",
+                "--height=~50%", "--reverse", "--no-sort",
+                "--prompt=session> ",
+            ],
+            input=feed, capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        sys.exit(0)  # cancelled
+    index = int(result.stdout.split("\t", 1)[0])
+    return sessions[index]
+
+
+def _prompt_choose(sessions, rows) -> Session | None:
+    if not sys.stdout.isatty():
+        rows = [re.sub(r"\033\[[0-9;]*m", "", row) for row in rows]
+    for i, row in enumerate(rows):
+        print(f"{i:3}  {row}")
+    try:
+        raw = input("session number> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not raw.isdigit() or int(raw) >= len(sessions):
+        print("invalid selection", file=sys.stderr)
+        return None
+    return sessions[int(raw)]
+
+
+def _session_json(s: Session) -> dict:
+    def iso(ts):
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    return {
+        "backend": s.backend,
+        "session_id": s.session_id,
+        "cwd": s.cwd,
+        "title": s.title,
+        "created": iso(s.created),
+        "last_active": iso(s.last_active),
+        "status": s.status,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ai-sessions",
+        description="Overview and recovery of AI CLI coding sessions.",
+    )
+    parser.add_argument("-n", "--limit", type=int, default=20,
+                        help="max rows to show (default: 20)")
+    parser.add_argument("--here", action="store_true",
+                        help="only sessions under the current directory")
+    parser.add_argument("--project", metavar="PATH",
+                        help="only sessions under PATH")
+    parser.add_argument("--backend", choices=sorted(BACKENDS),
+                        help="only this backend")
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable output")
+    parser.add_argument("command", nargs="?", default="list",
+                        choices=["list", "pick", "crashed"],
+                        help="list (default), pick (fzf + resume), "
+                             "crashed (sessions open at last shutdown)")
+    args = parser.parse_args(argv)
+    args.crashed_only = args.command == "crashed"
+
+    if args.command == "pick":
+        return cmd_pick(args)
+    if args.command == "crashed":
+        return cmd_crashed(args)
+    return cmd_list(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
