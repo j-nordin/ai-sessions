@@ -762,7 +762,7 @@ def main(argv=None):
         interactive = sys.stdout.isatty() and not args.json
         args.command = "pick" if interactive else "list"
     if args.command == "search" and not args.query:
-        parser.error("search requires a query, e.g.: ai-sessions search kgateway")
+        parser.error("search requires a query, e.g.: ai-sessions search \"flaky test\"")
     if args.command != "search" and args.query:
         parser.error(f"unexpected argument {args.query!r} "
                      f"(did you mean: ai-sessions search {args.query}?)")
