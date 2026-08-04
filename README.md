@@ -64,6 +64,27 @@ to a numbered prompt otherwise. Selecting a session changes into its original
 working directory and execs the backend's resume command
 (e.g. `claude --resume <session-id>`).
 
+Inside the picker, **Ctrl-/** toggles a preview pane showing the highlighted
+session's conversation — your prompts and the assistant's replies, with tool
+output and metadata filtered out — so you can confirm it's the right session
+before resuming.
+
+## Shell keybinding
+
+To open the picker with a hotkey (here Alt+A), add a small ZLE widget to your
+`~/.zshrc`:
+
+```zsh
+_ai_sessions_picker() {
+  command -v ai-sessions >/dev/null 2>&1 || { zle reset-prompt; return }
+  zle push-input        # stash any half-typed command line
+  BUFFER="ai-sessions"
+  zle accept-line
+}
+zle -N _ai_sessions_picker
+bindkey '\ea' _ai_sessions_picker   # Alt+A (overrides accept-and-hold)
+```
+
 ## Install
 
 ```console

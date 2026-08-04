@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -615,6 +616,52 @@ def cmd_crashed(args):
     return 0
 
 
+PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+
+
+def cmd_preview(path: str) -> int:
+    """Render one transcript as a readable conversation (fzf preview pane)."""
+    if not path or path == "-" or not os.path.isfile(path):
+        print("(no transcript on disk)")
+        return 0
+    backend = BACKENDS["claude"]
+    header_done = False
+    try:
+        size = os.path.getsize(path)
+        with open(path, errors="replace") as fh:
+            if size > PREVIEW_MAX_BYTES:
+                fh.seek(size - PREVIEW_MAX_BYTES)
+                fh.readline()  # drop partial line
+                print(f"{DIM}… earlier conversation truncated …{NC}\n")
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                kind = obj.get("type")
+                if kind not in ("user", "assistant"):
+                    continue
+                text = backend.searchable_text(obj)
+                if not text or not text.strip():
+                    continue
+                if not header_done:
+                    cwd = obj.get("cwd", "")
+                    ts = obj.get("timestamp", "")[:16].replace("T", " ")
+                    print(f"{DIM}{_short_path(cwd, 60)}   started {ts}{NC}\n")
+                    header_done = True
+                text = text.strip()
+                if kind == "user":
+                    print(f"{GREEN}{BOLD}❯ {text}{NC}")
+                else:
+                    print(text)
+                print()
+    except OSError:
+        print("(transcript unreadable)")
+    return 0
+
+
 def choose_and_resume(sessions: list[Session], rows: list[str]) -> int:
     chosen = _fzf_choose(sessions, rows) or _prompt_choose(sessions, rows)
     if chosen is None:
@@ -680,13 +727,21 @@ def cmd_search(args):
 def _fzf_choose(sessions, rows) -> Session | None:
     if not shutil.which("fzf"):
         return None
-    feed = "\n".join(f"{i}\t{row}" for i, row in enumerate(rows))
+    feed = "\n".join(
+        f"{i}\t{s.transcript_path or '-'}\t{row}"
+        for i, (s, row) in enumerate(zip(sessions, rows))
+    )
+    script = shlex.quote(os.path.abspath(sys.argv[0]))
     try:
         result = subprocess.run(
             [
-                "fzf", "--ansi", "--delimiter=\t", "--with-nth=2..",
+                "fzf", "--ansi", "--delimiter=\t", "--with-nth=3..",
                 "--height=~50%", "--reverse", "--no-sort",
                 "--prompt=session> ",
+                "--preview", f"{script} _preview {{2}}",
+                "--preview-window", "right,60%,wrap,hidden",
+                "--bind", "ctrl-/:toggle-preview",
+                "--header", "ctrl-/ preview · enter resume · esc quit",
             ],
             input=feed, capture_output=True, text=True,
         )
@@ -732,6 +787,10 @@ def _session_json(s: Session) -> dict:
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "_preview":  # fzf preview helper, not user-facing
+        return cmd_preview(argv[1] if len(argv) > 1 else "")
     parser = argparse.ArgumentParser(
         prog="ai-sessions",
         description="Overview and recovery of AI CLI coding sessions.",
@@ -778,4 +837,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    import signal
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # die quietly on | head
     sys.exit(main())
