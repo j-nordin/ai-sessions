@@ -17,6 +17,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -669,6 +671,473 @@ def run_search(sessions: list[Session], terms: list[str], phrase: str,
 
 
 # --------------------------------------------------------------------------
+# Ask — hand the hunt to a Claude Code session
+# --------------------------------------------------------------------------
+#
+# `search` matches the words you type. When you don't know the words — the
+# session called it "cert renewal" and you're typing "letsencrypt" — `ask`
+# spawns a headless Claude Code session that greps, reads and reasons over
+# the transcripts, and hands back the sessions it believes you mean. The
+# picker then opens on those, so the answer is still something you resume.
+
+ASK_TIMEOUT = int(os.environ.get("AI_SESSIONS_ASK_TIMEOUT", "600"))
+ASK_MAX_CANDIDATES = 200
+# Read-only toolset: no Write/Edit/NotebookEdit exists in the spawned
+# session at all, so the search cannot alter the transcripts it reads.
+ASK_TOOLS = "Bash,Read,Glob,Grep"
+
+ASK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {
+            "type": "string",
+            "description": "Short summary of what was found, with the "
+                           "concrete details from the session.",
+        },
+        "sessions": {
+            "type": "array",
+            "description": "Matching sessions, best first, at most 5.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "why": {"type": "string"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+                "required": ["session_id", "why"],
+            },
+        },
+    },
+    "required": ["answer", "sessions"],
+}
+
+ASK_PROMPT = """\
+You are searching my past Claude Code sessions to find the one I have in mind.
+
+**What I am looking for:** {question}
+
+**Where the sessions live:** `{claude_dir}/projects/<project-dir>/<session-uuid>.jsonl`
+— one JSONL transcript per session. Every line is a JSON object; conversation
+lines have `type` `"user"` or `"assistant"`, with the text under
+`message.content` (a string, or a list of blocks of which only `type ==
+"text"` is conversation). `tool_use` blocks and `tool_result` content are tool
+traffic, not things we said — useful evidence, but weaker than a real
+sentence. Lines of `type` `"ai-title"` (`aiTitle`) and `"last-prompt"`
+(`lastPrompt`) carry the session title and the final prompt. Transcripts under
+a `subagents/` subdirectory belong to subagents of the session named by their
+parent directory: if the match is in one of those, report the parent session's
+uuid, which is the name of the depth-1 transcript.
+
+**How to search:** the words I used above are probably not the words in the
+transcript. Try synonyms, hostnames, IPs, product and project names, and any
+other language I work in — my sessions mix languages freely. Start with
+`grep -lic` over the candidate paths to narrow, then pull the surrounding
+conversation out with a small `python3` script that `json.loads` each line;
+never dump raw JSONL, it is enormous and unreadable. Read deeply only in the
+handful of transcripts that survive the grep. If a topic spans several
+sessions, prefer the one where it was actually worked through over one that
+mentions it in passing. Aim to be done in a couple of minutes.
+
+**Candidate sessions** — {shown} of {total}, most recently active first, as
+`uuid  last-active  project  title`. Older transcripts are on disk too and are
+fair game if the answer is not in this list:
+
+{candidates}
+
+**Return your answer by calling StructuredOutput**, with `sessions` set to the
+matching session uuids, best first, at most 5 — each with `why` (one line:
+what was discussed there, and when) and `confidence` — and `answer` set to a
+few sentences on what you found, carrying the concrete details from the
+session (decisions, numbers, hostnames, file paths) so that I may not need to
+reopen it at all. If nothing matches, return an empty `sessions` list and say
+so in `answer`. Do not answer in prose instead: StructuredOutput is the only
+answer I will see.
+
+**Rules:** this is read-only. Do not write, edit or delete anything, do not
+run `claude`, and do not resume or open a session — I pick the session to
+resume from the results you return. Everything under `{claude_dir}` is my own
+data.
+"""
+
+
+class AskError(Exception):
+    """The search session could not be run, or returned nothing usable."""
+
+
+def _ask_candidates(sessions: list[Session], cap: int = ASK_MAX_CANDIDATES) -> str:
+    lines = []
+    for s in sessions[:cap]:
+        when = (
+            datetime.fromtimestamp(s.last_active).strftime("%Y-%m-%d %H:%M")
+            if s.last_active else "?"
+        )
+        lines.append(
+            f"{s.session_id}  {when}  "
+            f"{_short_path(s.cwd or '?', 40)}  "
+            f"{_truncate(s.title or '(no title)', 70)}"
+        )
+    return "\n".join(lines)
+
+
+def build_ask_prompt(question: str, sessions: list[Session]) -> str:
+    backend = BACKENDS.get("claude")
+    claude_dir = (
+        str(backend.claude_dir) if isinstance(backend, ClaudeBackend) else "~/.claude"
+    )
+    return ASK_PROMPT.format(
+        question=question,
+        claude_dir=claude_dir,
+        shown=min(len(sessions), ASK_MAX_CANDIDATES),
+        total=len(sessions),
+        candidates=_ask_candidates(sessions),
+    )
+
+
+_SESSION_TITLES: dict[str, str] = {}
+
+
+def _session_hint(text: str) -> str:
+    """Title of the first session uuid mentioned in `text`, if it resolves.
+
+    Turns "grep -c certbot 8c2f10ab-….jsonl" into a step that says which of
+    my sessions is being dug through, which is the interesting half.
+    """
+    for match in re.finditer(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", text):
+        session_id = match.group(0)
+        if session_id not in _SESSION_TITLES:
+            found = _lookup_session(session_id)
+            _SESSION_TITLES[session_id] = (found.title if found else "") or ""
+        title = _SESSION_TITLES[session_id]
+        if title:
+            return title
+    return ""
+
+
+def _term_width() -> int:
+    return max(40, shutil.get_terminal_size((100, 24)).columns - 1)
+
+
+def _tool_line(block: dict) -> str:
+    """One line describing a tool call, with the session it is about."""
+    name = str(block.get("name") or "tool")
+    args = block.get("input") if isinstance(block.get("input"), dict) else {}
+    if name == "StructuredOutput":
+        return "writing up the answer"
+    detail = str(
+        args.get("command")
+        or args.get("pattern")
+        or args.get("file_path")
+        or args.get("path")
+        or args.get("description")
+        or ""
+    )
+    hint = _session_hint(json.dumps(args, ensure_ascii=False))
+    # spend the width on the command, but never at the cost of the session
+    # title — that is what makes the step readable at a glance
+    budget = _term_width() - 14 - len(name) - (len(hint) + 5 if hint else 0)
+    line = f"{name} {_truncate(_clean_text(detail), max(20, budget))}".strip()
+    return line + (f"  → {hint}" if hint else "")
+
+
+def _result_line(obj: dict) -> str:
+    """The head of a tool result — what the step it closes actually found."""
+    text = ""
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            inner = block.get("content")
+            if isinstance(inner, str):
+                text = inner
+            elif isinstance(inner, list):
+                text = "\n".join(
+                    b.get("text", "") for b in inner
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if text:
+                break
+    raw = obj.get("tool_use_result")
+    if not text and isinstance(raw, str):
+        text = raw
+    elif not text and isinstance(raw, dict):
+        text = str(raw.get("stdout") or raw.get("stderr") or raw.get("text") or "")
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    head = _clean_text(lines[0])
+    if not head:
+        return ""
+    more = f" (+{len(lines) - 1} more)" if len(lines) > 1 else ""
+    hint = _session_hint(head)
+    return _truncate(head, 90) + more + (f"  → {hint}" if hint else "")
+
+
+class AskProgress:
+    """Live view of what the search session is doing, on stderr.
+
+    Finished steps scroll; the step in flight stays on one line with a spinner
+    and its own clock, so a slow grep reads as work rather than as a hang.
+    Without a tty (piped, or inside another tool) the same steps print as
+    plain lines and nothing is ever rewritten.
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    SLOW_STEP = 3.0  # seconds before a finished step is worth timing
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stderr
+        self.tty = self.stream.isatty()
+        self.started = time.time()
+        self.step_started = self.started
+        self.current = ""
+        self.marker = "·"
+        self.working = False
+        self.placeholder = False
+        self.frame = 0
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.ticker = None
+
+    def __enter__(self):
+        if self.tty:
+            self.ticker = threading.Thread(target=self._tick, daemon=True)
+            self.ticker.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    # -- steps ------------------------------------------------------------
+
+    def step(self, text: str, marker: str = "·"):
+        """Start a new step; the previous one is finished and scrolls up."""
+        text = _clean_text(text)
+        if not text:
+            return
+        with self.lock:
+            self._finish()
+            self.current, self.marker = text, marker
+            self.working = marker == "»"
+            self.placeholder = False
+            self.step_started = time.time()
+            self._draw()
+
+    def thinking(self, tokens: int):
+        """Reasoning tokens tick by while nothing else is happening — the one
+        signal that the session is alive between a result and the next tool."""
+        with self.lock:
+            if self.working or not self.current:
+                return  # a tool is running; that is the more useful line
+            self.current = f"thinking… ({tokens} tokens)"
+            self._draw()
+
+    def note(self, text: str, marker: str = "↳"):
+        """Close the current step with what it found, then wait on the model."""
+        text = _clean_text(text)
+        with self.lock:
+            self._finish()
+            if text:
+                self._writeln(marker, text)
+            self.current, self.marker = "thinking…", "·"
+            self.working = False
+            self.placeholder = True
+            self.step_started = time.time()
+            self._draw()
+
+    def close(self, summary: str = ""):
+        self.stopped.set()
+        if self.ticker:
+            self.ticker.join(timeout=0.3)
+        with self.lock:
+            self._finish()
+            if summary:
+                self._writeln("·", _clean_text(summary))
+
+    # -- rendering --------------------------------------------------------
+
+    def _tick(self):
+        while not self.stopped.wait(0.12):
+            with self.lock:
+                self.frame += 1
+                self._draw()
+
+    def _draw(self):
+        if not self.tty or not self.current:
+            return
+        spin = self.FRAMES[self.frame % len(self.FRAMES)]
+        elapsed = f"{int(time.time() - self.started)}s"
+        body = _truncate(self.current, max(20, _term_width() - len(elapsed) - 6))
+        self.stream.write(f"\r\033[2K{DIM}{spin} {body}  {elapsed}{NC}")
+        self.stream.flush()
+
+    def _finish(self):
+        """Turn the in-flight step into a scrolled line."""
+        if not self.current:
+            return
+        took = time.time() - self.step_started
+        if self.placeholder and self.current == "thinking…" and took < 1.0:
+            self.current = ""  # never waited on the model: nothing to report
+            return
+        suffix = f" ({int(took)}s)" if took >= self.SLOW_STEP else ""
+        self._writeln(self.marker, self.current + suffix)
+        self.current = ""
+
+    def _writeln(self, marker: str, text: str):
+        if self.tty:
+            self.stream.write("\r\033[2K")
+            line = f"{DIM}{marker} {_truncate(text, _term_width() - 2)}{NC}\n"
+        else:
+            line = f"{marker} {text}\n"
+        self.stream.write(line)
+        self.stream.flush()
+
+
+def run_ask_agent(prompt: str, model: str | None = None) -> dict:
+    """Run one headless Claude Code session and return its structured answer.
+
+    The session is deliberately plain — no system-prompt surgery, no effort or
+    budget overrides — apart from three things the task itself requires: a
+    read-only toolset, no MCP servers (nothing here needs them, and loading
+    them costs seconds), and no session persistence, so hunting for a session
+    never adds a session to the list you are hunting through.
+
+    Its stream is narrated on stderr as it arrives, so a hunt that takes a
+    minute is a minute of visible work rather than a blank terminal.
+    """
+    if not shutil.which("claude"):
+        raise AskError("claude is not on PATH — 'ask' needs Claude Code")
+    argv = [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose",
+        "--tools", ASK_TOOLS,
+        "--permission-mode", "auto",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--json-schema", json.dumps(ASK_SCHEMA),
+    ]
+    if model:
+        argv += ["--model", model]
+
+    started = time.time()
+    result = None
+    with AskProgress() as progress:
+        progress.step("starting a claude session…", "»")
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=str(Path.home()),
+            )
+        except OSError as exc:
+            raise AskError(f"could not run claude: {exc}") from exc
+        try:
+            for line in proc.stdout:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                kind = obj.get("type")
+                if kind == "system" and obj.get("subtype") == "init":
+                    progress.step("reading the candidate sessions…")
+                elif kind == "system" and obj.get("subtype") == "thinking_tokens":
+                    progress.thinking(int(obj.get("estimated_tokens") or 0))
+                elif kind == "assistant":
+                    for block in (obj.get("message") or {}).get("content") or []:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
+                            progress.step(block.get("text", ""))
+                        elif block.get("type") == "thinking":
+                            progress.step(block.get("thinking", ""))
+                        elif block.get("type") == "tool_use":
+                            progress.step(_tool_line(block), "»")
+                elif kind == "user":
+                    progress.note(_result_line(obj))
+                elif kind == "result":
+                    result = obj  # close() prints the summary line
+                if time.time() - started > ASK_TIMEOUT:
+                    proc.kill()
+                    raise AskError(f"the search took longer than {ASK_TIMEOUT}s")
+        except KeyboardInterrupt:
+            proc.kill()
+            raise AskError("cancelled") from None
+        finally:
+            if proc.poll() is None:
+                proc.wait()
+
+        stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        if result is None:
+            detail = stderr.splitlines()[-1] if stderr else "no result was returned"
+            raise AskError(f"the search session failed: {detail}")
+        if result.get("is_error"):
+            raise AskError(
+                f"the search session failed: {result.get('subtype') or 'error'}"
+            )
+
+        data = result.get("structured_output")
+        if not isinstance(data, dict):
+            text = _clean_text(str(result.get("result") or ""))
+            raise AskError(
+                "the search session returned no structured answer"
+                + (f":\n{_truncate(text, 400)}" if text else "")
+            )
+        cost = result.get("total_cost_usd")
+        took = int((result.get("duration_ms") or 0) / 1000) or int(time.time() - started)
+        progress.close(
+            f"done in {took}s"
+            + (f" · ${cost:.2f}" if isinstance(cost, (int, float)) else "")
+        )
+    return data
+
+
+def _lookup_session(session_id: str) -> Session | None:
+    """Build a Session for an id outside the scoped list (claude backend)."""
+    backend = BACKENDS.get("claude")
+    if not isinstance(backend, ClaudeBackend) or not UUID_RE.match(session_id):
+        return None
+    projects = backend.claude_dir / "projects"
+    try:
+        matches = sorted(projects.glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return None
+    for path in matches:
+        try:
+            return backend._parse_transcript(path)
+        except OSError:
+            continue
+    return None
+
+
+def resolve_ask_sessions(items: list, sessions: list[Session]) -> list[Session]:
+    """Map the agent's session ids back onto real, resumable sessions."""
+    by_id = {s.session_id: s for s in sessions}
+    resolved: list[Session] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        session_id = str(item.get("session_id") or "").strip()
+        if not session_id or session_id in seen:
+            continue
+        session = by_id.get(session_id) or _lookup_session(session_id)
+        if session is None:
+            continue  # an id we cannot find on disk is not resumable
+        seen.add(session_id)
+        confidence = str(item.get("confidence") or "").strip().lower()
+        session.match_note = {"high": "high", "medium": "med", "low": "low"}.get(
+            confidence, "claude"
+        )
+        session.snippet = _clean_text(str(item.get("why") or "")) or "(no reason given)"
+        resolved.append(session)
+    return resolved
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -850,8 +1319,9 @@ def cmd_preview(path: str) -> int:
 
 def choose_and_resume(sessions: list[Session], rows: list[str],
                       reload_argv: list[str] | None = None,
-                      query: str = "") -> int:
-    chosen = (_fzf_choose(sessions, rows, reload_argv, query)
+                      query: str = "",
+                      ask_argv: list[str] | None = None) -> int:
+    chosen = (_fzf_choose(sessions, rows, reload_argv, query, ask_argv)
               or _prompt_choose(sessions, rows))
     if chosen is None:
         return 1
@@ -875,7 +1345,8 @@ def cmd_pick(args):
         print("no sessions found", file=sys.stderr)
         return 1
     rows = render_rows(sessions, color=True)[1:]  # skip header
-    return choose_and_resume(sessions, rows, _scope_argv(args, window=True))
+    return choose_and_resume(sessions, rows, _scope_argv(args, window=True),
+                             ask_argv=_ask_argv(args))
 
 
 def _scope_argv(args, window: bool = False) -> list[str]:
@@ -901,6 +1372,24 @@ def _scope_argv(args, window: bool = False) -> list[str]:
         argv.append("--crashed-only")
     if window:
         argv.append("--window")
+    return argv
+
+
+def _ask_argv(args) -> list[str]:
+    """The scope flags to replay when the picker hands the hunt to claude.
+
+    Deliberately without `-n`: the query you typed came up short, so the
+    search should widen to every session in scope, not the rows on screen.
+    """
+    argv = []
+    if args.here:
+        argv.append("--here")
+    if args.project:
+        argv += ["--project", args.project]
+    if args.backend:
+        argv += ["--backend", args.backend]
+    if getattr(args, "model", None):
+        argv += ["--model", args.model]
     return argv
 
 
@@ -981,14 +1470,15 @@ def cmd_search(args):
     if not results:
         print(f"no sessions match {args.query!r}"
               + ("" if args.everything else " — try --everything to include tool output")
-)
+              + f"\nor let claude search: ai-sessions ask {args.query}")
         return 1
     results = results[: args.limit]
     color = sys.stdout.isatty()
     note = ""
     if relaxed:
         note = (f"no session mentions all {len(terms)} terms"
-                " — showing the best partial matches")
+                " — showing the best partial matches;"
+                " alt-enter hands the hunt to claude")
 
     if color:
         rows = render_rows(results, color=True, show_matches=True)[1:]
@@ -999,10 +1489,72 @@ def cmd_search(args):
         if note:
             print(f"{YELLOW}{note}{NC}")
         # seed the picker with this query so editing it re-searches
-        return choose_and_resume(results, rows, _scope_argv(args), args.query)
+        return choose_and_resume(results, rows, _scope_argv(args), args.query,
+                                 ask_argv=_ask_argv(args))
 
     if note:
         print(note)
+    rows = render_rows(results, color, show_matches=True)
+    print(rows[0])
+    for row, s in zip(rows[1:], results):
+        print(row)
+        print("     " + render_snippet(s, terms, color, width=100))
+    return 0
+
+
+def cmd_ask(args):
+    """Let a Claude Code session do the searching, then pick from its answer."""
+    question = (getattr(args, "question", "") or "").strip()
+    if not question:
+        print("ask needs a question, e.g.: ai-sessions ask "
+              "'where did I sort out the cert that keeps expiring'",
+              file=sys.stderr)
+        return 1
+    sessions = gather(args)
+    if not sessions:
+        print("no sessions found", file=sys.stderr)
+        return 1
+    try:
+        data = run_ask_agent(build_ask_prompt(question, sessions), args.model)
+    except AskError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    answer = _clean_text(str(data.get("answer") or ""))
+    results = resolve_ask_sessions(data.get("sessions") or [], sessions)
+
+    if args.json:
+        out = {
+            "question": question,
+            "answer": answer,
+            "sessions": [
+                dict(_session_json(s), why=s.snippet, confidence=s.match_note)
+                for s in results[: args.limit]
+            ],
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    color = sys.stdout.isatty()
+    if answer:
+        width = min(100, max(50, shutil.get_terminal_size((100, 24)).columns - 2))
+        text = "\n".join(textwrap.wrap(answer, width))
+        print(f"{DIM}{text}{NC}\n" if color else f"{text}\n")
+    if not results:
+        print("claude found no matching session")
+        return 1
+
+    results = results[: args.limit]
+    terms = parse_query(question)
+    if color:
+        rows = render_rows(results, color=True, show_matches=True)[1:]
+        rows = [
+            row + "  " + render_snippet(s, terms, color=True, width=60)
+            for row, s in zip(rows, results)
+        ]
+        # no live search over these rows: the set *is* claude's answer. Asking
+        # again (alt-enter) re-runs the hunt with a reworded question.
+        return choose_and_resume(results, rows, ask_argv=_ask_argv(args))
     rows = render_rows(results, color, show_matches=True)
     print(rows[0])
     for row, s in zip(rows[1:], results):
@@ -1023,7 +1575,32 @@ def _feed(sessions, rows) -> str:
     )
 
 
-def _fzf_choose(sessions, rows, reload_argv=None, query="") -> Session | None:
+# alt-enter is the key; ctrl-g is the same thing for terminals that swallow it
+ASK_KEYS = ("alt-enter", "ctrl-g")
+
+
+def _exec_ask(ask_argv: list[str], question: str) -> None:
+    """Re-enter as `ai-sessions ask` on the terminal the picker was called on.
+
+    fzf's own `become` action would run the search in fzf's place — but fzf's
+    stdout and stderr are the pipes this process reads the selection through,
+    so the search would narrate itself into a pipe and print its results into
+    one too, which looks exactly like nothing happening. Having fzf report the
+    key and the query back instead puts the search where the picker was: on
+    the real terminal.
+    """
+    script = os.path.abspath(sys.argv[0])
+    question = question.strip()
+    if not question:
+        print("nothing typed — type what you are looking for, then ask",
+              file=sys.stderr)
+        os.execv(sys.executable, [sys.executable, script, "pick", *ask_argv])
+    os.execv(sys.executable,
+             [sys.executable, script, "ask", *ask_argv, "--", question])
+
+
+def _fzf_choose(sessions, rows, reload_argv=None, query="",
+                ask_argv=None) -> Session | None:
     if not shutil.which("fzf"):
         return None
     script = shlex.quote(os.path.abspath(sys.argv[0]))
@@ -1035,7 +1612,14 @@ def _fzf_choose(sessions, rows, reload_argv=None, query="") -> Session | None:
         "--preview-window", "right,60%,wrap,hidden",
         "--bind", "ctrl-/:toggle-preview",
     ]
-    header = "ctrl-/ preview · enter resume · esc quit"
+    keys = ["ctrl-/ preview", "enter resume", "esc quit"]
+    prefix = ""
+    if ask_argv is not None:
+        # The typed query searches for words. When the words are wrong, the
+        # same query becomes a question for a claude session: fzf reports the
+        # key and the query it had, and _exec_ask takes it from there.
+        argv += ["--expect=" + ",".join(ASK_KEYS), "--print-query"]
+        keys.insert(0, f"{ASK_KEYS[0]} ask claude")
     if reload_argv is not None:
         # Typing has to search conversation content, not just the visible
         # row. fzf can't match fields it doesn't display, so hand every
@@ -1051,8 +1635,8 @@ def _fzf_choose(sessions, rows, reload_argv=None, query="") -> Session | None:
         ]
         scope = (f"these {len(sessions)} sessions" if "--window" in reload_argv
                  else "every session")
-        header = f"type to search {scope} · " + header
-    argv += ["--header", header]
+        prefix = f"type to search {scope} · "
+    argv += ["--header", prefix + " · ".join(keys)]
     try:
         result = subprocess.run(
             argv, input=_feed(sessions, rows), capture_output=True, text=True,
@@ -1061,9 +1645,18 @@ def _fzf_choose(sessions, rows, reload_argv=None, query="") -> Session | None:
         return None
     if result.returncode != 0 or not result.stdout.strip():
         sys.exit(0)  # cancelled
+    lines = result.stdout.split("\n")
+    if ask_argv is not None:
+        # --print-query --expect prints the query, then the key pressed (empty
+        # for a plain enter), then the selection
+        typed = lines.pop(0) if lines else ""
+        pressed = lines.pop(0) if lines else ""
+        if pressed in ASK_KEYS:
+            _exec_ask(ask_argv, typed)  # never returns
     # the reloaded list is built by a child process, so the chosen line
     # carries everything needed to resume rather than an index into `sessions`
-    fields = result.stdout.rstrip("\n").split("\t")
+    chosen = next((ln for ln in lines if ln.strip()), "")
+    fields = chosen.rstrip("\n").split("\t")
     if len(fields) < 4 or fields[1] not in BACKENDS:
         return None
     return Session(
@@ -1124,6 +1717,9 @@ def _add_scope_args(parser):
     parser.add_argument("--recent", action="store_true",
                         help="search: order hits by last activity instead of "
                              "relevance")
+    parser.add_argument("--model", metavar="MODEL",
+                        help="ask: model for the search session "
+                             "(default: your Claude Code default)")
 
 
 def main(argv=None):
@@ -1139,15 +1735,19 @@ def main(argv=None):
     )
     _add_scope_args(parser)
     parser.add_argument("command", nargs="?", default=None,
-                        choices=["list", "pick", "crashed", "search"],
+                        choices=["list", "pick", "crashed", "search", "ask"],
                         help="pick (fzf + resume; default on a terminal), "
                              "list (table; default when piped), "
                              "crashed (sessions open at last shutdown), "
-                             "search <query> (full-text search + resume)")
+                             "search <query> (full-text search + resume), "
+                             "ask <question> (let claude find the session)")
     parser.add_argument("query", nargs="*",
-                        help="terms to search for (search command only); every "
-                             "term must appear, a quoted group matches as a phrase")
+                        help="terms to search for (search), or a question in "
+                             "plain words (ask); every search term must appear, "
+                             "a quoted group matches as a phrase")
     args = parser.parse_args(argv)
+    # `ask` takes the words as written — it is a question, not a term list
+    args.question = " ".join(args.query)
     # a shell-quoted group arrives as one argv element with spaces in it —
     # re-quote it so parse_query keeps it together as a phrase
     args.query = " ".join(
@@ -1159,7 +1759,10 @@ def main(argv=None):
         args.command = "pick" if interactive else "list"
     if args.command == "search" and not args.query:
         parser.error("search requires a query, e.g.: ai-sessions search \"flaky test\"")
-    if args.command != "search" and args.query:
+    if args.command == "ask" and not args.question:
+        parser.error("ask requires a question, e.g.: ai-sessions ask "
+                     "\"where did I sort out the cert that keeps expiring\"")
+    if args.command not in ("search", "ask") and args.query:
         parser.error(f"unexpected argument {args.query!r} "
                      f"(did you mean: ai-sessions search {args.query}?)")
     args.crashed_only = args.command == "crashed"
@@ -1170,6 +1773,8 @@ def main(argv=None):
         return cmd_crashed(args)
     if args.command == "search":
         return cmd_search(args)
+    if args.command == "ask":
+        return cmd_ask(args)
     return cmd_list(args)
 
 
