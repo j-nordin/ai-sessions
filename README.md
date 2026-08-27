@@ -18,8 +18,10 @@ The backend layer is pluggable, so other AI CLIs can be added later
 
 Running `ai-sessions` on a terminal opens an interactive picker over your
 recent sessions — select one and it resumes in its original project
-directory. When output is piped (or with `--json`), it prints the table
-instead, same as `ai-sessions list`:
+directory. Typing in the picker searches what was *said* in those sessions,
+not just the titles on screen, so you can start from the list and narrow to
+the session you actually mean. When output is piped (or with `--json`), it
+prints the table instead, same as `ai-sessions list`:
 
 ```console
 $ ai-sessions list
@@ -39,11 +41,24 @@ Full-text search finds the session where something was discussed — on a
 terminal the results open in the picker, piped they print with snippets:
 
 ```console
-$ ai-sessions search "flaky test" | cat
+$ ai-sessions search flaky cache | cat
    LAST ACTIVE  PROJECT               TITLE                        MATCHES  ID
- ✗ 2h ago      ~/work/my-project     Fix flaky integration test   12       3f9f264f
+ ✗ 2h ago      ~/work/my-project     Fix flaky integration test   2/2·12   3f9f264f
      …the flaky test only fails when the cache is cold…
 ```
+
+Every term has to appear somewhere in the session; quote a group to match it
+as a phrase (`search "flaky test"`). If nothing mentions all of them, the best
+partial matches are shown instead, with a note. The `MATCHES` column reads
+`terms matched / terms searched · matching messages`.
+
+Results are ranked by relevance, not date. Ordered by, roughly in order of
+weight: how many of your terms the session covers (rare terms count for more
+than common ones), whether the whole query appears verbatim, whether a single
+message hits several terms at once, terms in the session title, how often the
+terms recur in your own prompts, and — as a nudge, not the ordering — how
+recently the session was active. `--recent` restores plain reverse-chronological
+order.
 
 By default search matches conversation text (your prompts, the assistant's
 replies, session titles). Add `--everything` to also match tool output —
@@ -52,7 +67,7 @@ host/file?" hunts.
 
 ```console
 $ ai-sessions crashed        # only the sessions left open at the last shutdown
-$ ai-sessions search <text>  # find sessions by content, then resume one
+$ ai-sessions search <terms> # find sessions by content, then resume one
 $ ai-sessions --here         # only sessions under the current directory
 $ ai-sessions --project ~/work/my-project
 $ ai-sessions -n 50          # show more rows
@@ -68,6 +83,26 @@ Inside the picker, **Ctrl-/** toggles a preview pane showing the highlighted
 session's conversation — your prompts and the assistant's replies, with tool
 output and metadata filtered out — so you can confirm it's the right session
 before resuming.
+
+Typing runs the same ranked search as `ai-sessions search`, over every
+message rather than the visible row, and the `MATCHES` column and snippets
+appear as soon as you have a query.
+
+**Typing searches the sessions the picker is holding, and only those.** The
+plain picker holds a recent window, so `-n` sets how far back both the list
+and the search reach — `ai-sessions -n 200` searches 200 sessions, the
+default searches 20. `--here` and `--project` narrow it the same way, and the
+header names the population you are searching. `search <terms>` instead
+populates from every session in scope, so a picker opened that way keeps
+searching broadly; it also arrives holding your query, so you can keep
+editing it rather than re-running the command.
+
+Two consequences of searching content rather than the row: matching is by
+whole terms, so fzf's fuzzy title matching (`sdgi` for
+`synthetic-defect-generation-investigation`) no longer applies, and a query
+that only matches a session's directory is listed after the content hits,
+labelled `path`. Without `fzf` the picker falls back to a static numbered
+prompt, which cannot search.
 
 ## Shell keybinding
 
@@ -116,10 +151,12 @@ of currently running sessions in `~/.claude/sessions/<pid>.json`.
   after the stale entry, the session was since resumed and is not flagged.
 - Only bounded head/tail reads are performed per transcript, so listing stays
   fast even with multi-hundred-MB transcripts.
-- **Search** needs no index: a `grep -liF` pass narrows to candidate
-  transcripts, which are then streamed line by line to match only
-  conversation text (or everything, with `--everything`). Case-insensitive
-  fixed-string matching.
+- **Search** needs no index: one `grep -liF` pass per term narrows to the
+  candidate transcripts and doubles as the document frequency behind the
+  IDF weights, so rare terms outrank common ones. The candidates are then
+  streamed line by line to match only conversation text (or everything, with
+  `--everything`) and scored. Matching is case-insensitive fixed-string
+  throughout — query case never affects results or ranking.
 
 Everything is read-only: `ai-sessions` never writes to the backend's data
 directories. Set `CLAUDE_DIR` to point the claude backend at a different

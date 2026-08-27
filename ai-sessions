@@ -10,6 +10,7 @@ Backends are pluggable; currently implemented: claude (Claude Code).
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -53,6 +54,18 @@ class Session:
     transcript_path: str = ""
     match_count: int = 0
     snippet: str = ""
+    score: float = 0.0
+    term_hits: int = 0   # query terms this session matched
+    term_total: int = 0  # query terms searched for
+    match_note: str = ""  # label instead of a count, for a non-content hit
+
+    @property
+    def match_label(self) -> str:
+        if self.match_note:
+            return self.match_note
+        if self.term_total > 1:
+            return f"{self.term_hits}/{self.term_total}·{self.match_count}"
+        return str(self.match_count)
 
 
 # --------------------------------------------------------------------------
@@ -424,69 +437,235 @@ def _truncate(text: str, width: int) -> str:
     return text[: width - 1] + "…"
 
 
-def _make_snippet(text: str, query: str, width: int = 70) -> str:
+def _make_snippet(text: str, terms: list[str], width: int = 70) -> str:
+    """Window of `text` centred on its first matching term."""
     text = _clean_text(text)
-    idx = text.lower().find(query.lower())
-    if idx < 0:
+    low = text.lower()
+    found = [(low.find(t), t) for t in terms]
+    found = [(idx, t) for idx, t in found if idx >= 0]
+    if not found:
         return _truncate(text, width)
-    start = max(0, idx - max(0, (width - len(query)) // 2))
+    idx, term = min(found)
+    start = max(0, idx - max(0, (width - len(term)) // 2))
     end = min(len(text), start + width)
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(text) else ""
     return prefix + text[start:end] + suffix
 
 
-def _grep_candidates(query: str, paths: list[str]) -> list[str]:
-    """Cheap first pass: files that contain the query anywhere at all."""
-    if not paths:
-        return []
+# --------------------------------------------------------------------------
+# Search
+# --------------------------------------------------------------------------
+
+# Relevance weights. Coverage dominates: a session that mentions every term
+# beats one that mentions the rarest term a hundred times. Recency only
+# nudges — it used to be the sole ordering, which buried the best hits.
+W_COVERAGE = 100.0     # query terms present anywhere in the session
+W_CONVERSATION = 30.0  # ... and present in conversation, not just tool output
+W_PHRASE = 45.0        # the whole query appears verbatim
+W_PROXIMITY = 30.0     # best single message's own term coverage
+W_TITLE = 20.0         # terms in the session title
+W_USER_FREQ = 20.0     # repetition in my own prompts
+W_ASSIST_FREQ = 10.0   # repetition in replies
+W_RAW_FREQ = 5.0       # repetition in tool output (--everything)
+W_RECENCY = 10.0       # decays with a 45-day half-life
+FREQ_SATURATION = 25   # match count at which a frequency term maxes out
+
+TERM_RE = re.compile(r'"([^"]*)"|(\S+)')
+
+
+def parse_query(query: str) -> list[str]:
+    """Split a query into terms; "quoted text" stays a single term."""
+    terms: list[str] = []
+    for quoted, bare in TERM_RE.findall(query):
+        term = (quoted or bare).strip().lower()
+        if term and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def query_phrase(query: str) -> str:
+    """The whole query as one contiguous phrase, or "" if that's meaningless."""
+    if '"' in query:
+        return ""  # explicit quoting already expresses the phrase
+    phrase = " ".join(query.lower().split())
+    return phrase if " " in phrase else ""
+
+
+def _grep_hits(terms: list[str], paths: list[str]) -> dict[str, set[str]]:
+    """Per-term set of transcripts containing it anywhere (a cheap prefilter).
+
+    Doubles as document frequency for the IDF weights. Falls back to "every
+    term is in every file" when grep is unavailable, which degrades to a full
+    scan with uniform term weights.
+    """
+    hits: dict[str, set[str]] = {}
+    for term in terms:
+        matched: set[str] = set()
+        for chunk in (paths[i:i + 500] for i in range(0, len(paths), 500)):
+            try:
+                result = subprocess.run(
+                    ["grep", "-l", "-i", "-F", "--", term, *chunk],
+                    capture_output=True, text=True,
+                )
+            except OSError:
+                return {t: set(paths) for t in terms}  # no grep available
+            if result.returncode > 1:
+                return {t: set(paths) for t in terms}  # grep error
+            matched.update(p for p in result.stdout.splitlines() if p)
+        hits[term] = matched
+    return hits
+
+
+def _scan_transcript(path: str, backend: Backend, terms: list[str],
+                     phrase: str, everything: bool) -> dict | None:
+    """Match statistics for one transcript, or None if it's unreadable."""
+    stats = {
+        "matched": set(),      # terms found in conversation text
+        "raw_matched": set(),  # terms found only in tool output
+        "user": 0,            # matching messages I wrote
+        "assistant": 0,       # matching replies
+        "raw": 0,             # matching tool-output lines
+        "phrase": False,
+        "best_hits": (),      # terms of the most on-point single message
+        "snippet_text": "",
+    }
+    best_rank = -1.0
     try:
-        result = subprocess.run(
-            ["grep", "-l", "-i", "-F", "--", query, *paths],
-            capture_output=True, text=True,
-        )
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                low = line.lower()
+                present = [t for t in terms if t in low]
+                if not present:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    obj = None
+                text = backend.searchable_text(obj) if isinstance(obj, dict) else None
+                if not text:
+                    if everything:
+                        stats["raw"] += 1
+                        stats["raw_matched"].update(present)
+                    continue
+                low_text = text.lower()
+                hits = [t for t in present if t in low_text]
+                if not hits:
+                    if everything:
+                        stats["raw"] += 1
+                        stats["raw_matched"].update(present)
+                    continue
+                stats["matched"].update(hits)
+                kind = obj.get("type")
+                if kind in ("ai-title", "last-prompt"):
+                    continue  # metadata mirroring the title/prompt: no double count
+                is_user = kind == "user"
+                if is_user:
+                    stats["user"] += 1
+                else:
+                    stats["assistant"] += 1
+                line_phrase = bool(phrase) and phrase in low_text
+                stats["phrase"] = stats["phrase"] or line_phrase
+                rank = len(hits) + (0.5 if line_phrase else 0.0) + (0.2 if is_user else 0.0)
+                if rank > best_rank:
+                    best_rank = rank
+                    stats["best_hits"] = tuple(hits)
+                    stats["snippet_text"] = text
     except OSError:
-        return paths  # no grep available — scan everything in Python
-    if result.returncode > 1:
-        return paths  # grep error — fall back to full scan
-    return [p for p in result.stdout.splitlines() if p]
+        return None
+    return stats
 
 
-def run_search(sessions: list[Session], query: str, everything: bool) -> list[Session]:
-    q = query.lower()
+def _recency_bonus(last_active: float | None) -> float:
+    if not last_active:
+        return 0.0
+    age_days = max(0.0, (time.time() - last_active) / 86400)
+    return W_RECENCY * 0.5 ** (age_days / 45.0)
+
+
+def _score(stats: dict, session: Session, terms: list[str],
+           idf: dict[str, float]) -> float:
+    total = sum(idf.values()) or 1.0
+
+    def weight(found) -> float:
+        return sum(idf[t] for t in found if t in idf) / total
+
+    def freq(n: int) -> float:
+        return min(1.0, math.log1p(n) / math.log1p(FREQ_SATURATION))
+
+    title = (session.title or "").lower()
+    return (
+        W_COVERAGE * weight(stats["matched"] | stats["raw_matched"])
+        + W_CONVERSATION * weight(stats["matched"])
+        + W_PHRASE * (1.0 if stats["phrase"] else 0.0)
+        + W_PROXIMITY * weight(stats["best_hits"])
+        + W_TITLE * weight([t for t in terms if t in title])
+        + W_USER_FREQ * freq(stats["user"])
+        + W_ASSIST_FREQ * freq(stats["assistant"])
+        + W_RAW_FREQ * freq(stats["raw"])
+        + _recency_bonus(session.last_active)
+    )
+
+
+def run_search(sessions: list[Session], terms: list[str], phrase: str,
+               everything: bool, recent_first: bool = False,
+               ) -> tuple[list[Session], bool]:
+    """Rank sessions by how well they match `terms`.
+
+    Sessions matching every term win; only if none does are partial matches
+    shown, and the returned flag says so. Returns (results, relaxed).
+    """
     by_path = {s.transcript_path: s for s in sessions if s.transcript_path}
-    results = []
-    for path in _grep_candidates(query, list(by_path)):
-        session = by_path.get(path)
-        if session is None:
-            continue
-        backend = BACKENDS[session.backend]
-        count = 0
-        snippet = ""
-        try:
-            with open(path, errors="replace") as fh:
-                for line in fh:
-                    if q not in line.lower():
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        obj = None
-                    text = backend.searchable_text(obj) if isinstance(obj, dict) else None
-                    if text and q in text.lower():
-                        count += 1
-                        if not snippet:
-                            snippet = _make_snippet(text, query)
-                    elif everything:
-                        count += 1
-        except OSError:
-            continue
-        if count:
-            session.match_count = count
-            session.snippet = snippet or "(match in tool output)"
-            results.append(session)
-    results.sort(key=lambda s: s.last_active or 0, reverse=True)
-    return results
+    if not by_path or not terms:
+        return [], False
+    paths = list(by_path)
+    hits = _grep_hits(terms, paths)
+    total_docs = len(paths)
+    idf = {
+        t: math.log(1 + total_docs / (1 + len(hits.get(t, ()))))
+        for t in terms
+    }
+    strict = set.intersection(*(hits[t] for t in terms))
+
+    scanned: dict[str, dict] = {}
+
+    def scan(candidates) -> list[Session]:
+        found = []
+        for path in candidates:
+            session = by_path[path]
+            stats = scanned.get(path)
+            if stats is None:
+                stats = _scan_transcript(
+                    path, BACKENDS[session.backend], terms, phrase, everything
+                )
+                if stats is None:
+                    continue
+                scanned[path] = stats
+            matched = stats["matched"] | stats["raw_matched"]
+            if not matched:
+                continue
+            session.match_count = stats["user"] + stats["assistant"] + stats["raw"]
+            session.term_hits = len(matched)
+            session.term_total = len(terms)
+            session.score = _score(stats, session, terms, idf)
+            session.snippet = (
+                _make_snippet(stats["snippet_text"], terms)
+                if stats["snippet_text"] else "(match in tool output)"
+            )
+            found.append(session)
+        return found
+
+    results = [s for s in scan(strict) if s.term_hits == len(terms)]
+    relaxed = False
+    if not results:
+        results = scan(strict | set().union(*hits.values()))
+        relaxed = len(terms) > 1 and bool(results)
+
+    if recent_first:
+        results.sort(key=lambda s: s.last_active or 0, reverse=True)
+    else:
+        results.sort(key=lambda s: (s.score, s.last_active or 0), reverse=True)
+    return results, relaxed
 
 
 # --------------------------------------------------------------------------
@@ -524,7 +703,10 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
     project_w = 24
     id_w = 8
     time_w = 11
-    matches_w = 7 if show_matches else 0
+    matches_w = (
+        max(7, *(len(s.match_label) for s in sessions)) if show_matches and sessions
+        else 7 if show_matches else 0
+    )
     show_backend = len({s.backend for s in sessions}) > 1
     backend_w = 8 if show_backend else 0
     fixed = (2 + time_w + 2 + project_w + 2 + id_w + 2
@@ -558,7 +740,7 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
             + ((s.backend.ljust(backend_w + 2)) if show_backend else "")
             + _short_path(s.cwd or "?", project_w).ljust(project_w + 2)
             + _truncate(s.title or "(no title)", title_w).ljust(title_w + 2)
-            + (str(s.match_count).ljust(matches_w + 2) if show_matches else "")
+            + (s.match_label.ljust(matches_w + 2) if show_matches else "")
             + s.session_id[:id_w]
         )
         if s.status == STATUS_CRASHED and color:
@@ -567,12 +749,16 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
     return rows
 
 
-def render_snippet(session: Session, query: str, color: bool, width: int) -> str:
+def render_snippet(session: Session, terms: list[str], color: bool, width: int) -> str:
     snippet = _truncate(session.snippet, width)
-    if not color:
+    if not color or not terms:
         return snippet
-    # highlight the query inside the dimmed snippet
-    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    # highlight every matched term inside the dimmed snippet; longest first so
+    # a term that contains another still highlights as one run
+    pattern = re.compile(
+        "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)),
+        re.IGNORECASE,
+    )
     lit = pattern.sub(lambda m: f"{NC}{YELLOW}{m.group(0)}{NC}{DIM}", snippet)
     return f"{DIM}{lit}{NC}"
 
@@ -662,8 +848,11 @@ def cmd_preview(path: str) -> int:
     return 0
 
 
-def choose_and_resume(sessions: list[Session], rows: list[str]) -> int:
-    chosen = _fzf_choose(sessions, rows) or _prompt_choose(sessions, rows)
+def choose_and_resume(sessions: list[Session], rows: list[str],
+                      reload_argv: list[str] | None = None,
+                      query: str = "") -> int:
+    chosen = (_fzf_choose(sessions, rows, reload_argv, query)
+              or _prompt_choose(sessions, rows))
     if chosen is None:
         return 1
     backend = BACKENDS[chosen.backend]
@@ -686,71 +875,201 @@ def cmd_pick(args):
         print("no sessions found", file=sys.stderr)
         return 1
     rows = render_rows(sessions, color=True)[1:]  # skip header
-    return choose_and_resume(sessions, rows)
+    return choose_and_resume(sessions, rows, _scope_argv(args, window=True))
+
+
+def _scope_argv(args, window: bool = False) -> list[str]:
+    """The scope flags to replay in the picker's live search, so that typing
+    searches exactly the sessions the picker was populated from.
+
+    `window` confines the search to the -n rows on screen — right for the
+    plain picker, which offers a recent window. `search` populates from the
+    whole scoped set instead, so it leaves this off and stays broad.
+    """
+    argv = ["-n", str(args.limit)]
+    if args.here:
+        argv.append("--here")
+    if args.project:
+        argv += ["--project", args.project]
+    if args.backend:
+        argv += ["--backend", args.backend]
+    if args.everything:
+        argv.append("--everything")
+    if args.recent:
+        argv.append("--recent")
+    if getattr(args, "crashed_only", False):
+        argv.append("--crashed-only")
+    if window:
+        argv.append("--window")
+    return argv
+
+
+def cmd_rows(argv: list[str]) -> int:
+    """One page of picker feed: the recent list, or ranked hits for a query.
+
+    Internal — fzf runs this on every keystroke (see _fzf_choose).
+    """
+    parser = argparse.ArgumentParser(prog="ai-sessions _rows", add_help=False)
+    _add_scope_args(parser)
+    parser.add_argument("--crashed-only", action="store_true")
+    parser.add_argument("--window", action="store_true")
+    parser.add_argument("query", nargs="*")
+    args = parser.parse_args(argv)
+    sessions = gather(args)
+    if args.crashed_only:
+        sessions = [s for s in sessions if s.status == STATUS_CRASHED]
+    if args.window:
+        # the picker holds this many rows, so this is the set on screen —
+        # search it and nothing else, or typing would surface sessions the
+        # list never offered. `-n` widens what is listed and searched at once.
+        sessions = sessions[: args.limit]
+
+    query = " ".join(args.query).strip()
+    terms = parse_query(query)
+    if len(query) < 2 or not terms:
+        # a single character matches nearly everything; not worth a scan
+        print(_feed(sessions, render_rows(sessions, color=True)[1:]))
+        return 0
+
+    results, _ = run_search(
+        sessions, terms, query_phrase(query), args.everything, args.recent
+    )
+    # content search never looks at the project path, but filtering the
+    # picker by project used to work — keep it reachable by appending
+    # path-only matches after the ranked hits
+    seen = {s.session_id for s in results}
+    extra = [
+        s for s in sessions
+        if s.session_id not in seen
+        and all(t in (s.cwd or "").lower() for t in terms)
+    ]
+    for s in extra:
+        s.match_note = "path"
+        s.snippet = "(matches the project path)"
+    results = (results + extra)[: args.limit]
+
+    rows = render_rows(results, color=True, show_matches=True)[1:]
+    rows = [
+        row + "  " + render_snippet(s, terms, color=True, width=60)
+        for row, s in zip(rows, results)
+    ]
+    print(_feed(results, rows))
+    return 0
 
 
 def cmd_search(args):
     sessions = gather(args)
-    results = run_search(sessions, args.query, args.everything)
+    terms = parse_query(args.query)
+    if not terms:
+        print("search requires a query", file=sys.stderr)
+        return 1
+    results, relaxed = run_search(
+        sessions, terms, query_phrase(args.query), args.everything, args.recent
+    )
     if args.json:
         out = []
         for s in results[: args.limit]:
             record = _session_json(s)
             record["match_count"] = s.match_count
+            record["terms_matched"] = s.term_hits
+            record["terms_total"] = s.term_total
+            record["score"] = round(s.score, 2)
             record["snippet"] = s.snippet
             out.append(record)
         print(json.dumps(out, indent=2))
         return 0
     if not results:
         print(f"no sessions match {args.query!r}"
-              + ("" if args.everything else " — try --everything to include tool output"))
+              + ("" if args.everything else " — try --everything to include tool output")
+)
         return 1
     results = results[: args.limit]
+    color = sys.stdout.isatty()
+    note = ""
+    if relaxed:
+        note = (f"no session mentions all {len(terms)} terms"
+                " — showing the best partial matches")
 
-    if sys.stdout.isatty():
+    if color:
         rows = render_rows(results, color=True, show_matches=True)[1:]
         rows = [
-            row + "  " + render_snippet(s, args.query, color=True, width=60)
+            row + "  " + render_snippet(s, terms, color=True, width=60)
             for row, s in zip(rows, results)
         ]
-        return choose_and_resume(results, rows)
+        if note:
+            print(f"{YELLOW}{note}{NC}")
+        # seed the picker with this query so editing it re-searches
+        return choose_and_resume(results, rows, _scope_argv(args), args.query)
 
-    color = False
+    if note:
+        print(note)
     rows = render_rows(results, color, show_matches=True)
     print(rows[0])
     for row, s in zip(rows[1:], results):
         print(row)
-        print("     " + render_snippet(s, args.query, color, width=100))
+        print("     " + render_snippet(s, terms, color, width=100))
     return 0
 
 
-def _fzf_choose(sessions, rows) -> Session | None:
+def _feed(sessions, rows) -> str:
+    """fzf input: the fields needed to resume or preview, then the rendered
+    row — the only visible part. Rows never contain tabs (titles go through
+    _clean_text), so tab is a safe delimiter.
+    """
+    return "\n".join(
+        f"{s.session_id}\t{s.backend}\t{s.cwd or ''}\t"
+        f"{s.transcript_path or '-'}\t{row}"
+        for s, row in zip(sessions, rows)
+    )
+
+
+def _fzf_choose(sessions, rows, reload_argv=None, query="") -> Session | None:
     if not shutil.which("fzf"):
         return None
-    feed = "\n".join(
-        f"{i}\t{s.transcript_path or '-'}\t{row}"
-        for i, (s, row) in enumerate(zip(sessions, rows))
-    )
     script = shlex.quote(os.path.abspath(sys.argv[0]))
+    argv = [
+        "fzf", "--ansi", "--delimiter=\t", "--with-nth=5..",
+        "--height=~50%", "--reverse", "--no-sort",
+        "--prompt=session> ",
+        "--preview", f"{script} _preview {{4}}",
+        "--preview-window", "right,60%,wrap,hidden",
+        "--bind", "ctrl-/:toggle-preview",
+    ]
+    header = "ctrl-/ preview · enter resume · esc quit"
+    if reload_argv is not None:
+        # Typing has to search conversation content, not just the visible
+        # row. fzf can't match fields it doesn't display, so hand every
+        # keystroke to our own ranked search instead of filtering locally.
+        # fzf kills a running reload when the query changes again, so the
+        # leading sleep lets a superseded query die before it costs a scan.
+        flags = " ".join(shlex.quote(a) for a in reload_argv)
+        argv += [
+            "--disabled",
+            "--bind",
+            f"change:reload:sleep 0.15; {script} _rows {flags} -- {{q}} || true",
+            "--query", query,
+        ]
+        scope = (f"these {len(sessions)} sessions" if "--window" in reload_argv
+                 else "every session")
+        header = f"type to search {scope} · " + header
+    argv += ["--header", header]
     try:
         result = subprocess.run(
-            [
-                "fzf", "--ansi", "--delimiter=\t", "--with-nth=3..",
-                "--height=~50%", "--reverse", "--no-sort",
-                "--prompt=session> ",
-                "--preview", f"{script} _preview {{2}}",
-                "--preview-window", "right,60%,wrap,hidden",
-                "--bind", "ctrl-/:toggle-preview",
-                "--header", "ctrl-/ preview · enter resume · esc quit",
-            ],
-            input=feed, capture_output=True, text=True,
+            argv, input=_feed(sessions, rows), capture_output=True, text=True,
         )
     except OSError:
         return None
     if result.returncode != 0 or not result.stdout.strip():
         sys.exit(0)  # cancelled
-    index = int(result.stdout.split("\t", 1)[0])
-    return sessions[index]
+    # the reloaded list is built by a child process, so the chosen line
+    # carries everything needed to resume rather than an index into `sessions`
+    fields = result.stdout.rstrip("\n").split("\t")
+    if len(fields) < 4 or fields[1] not in BACKENDS:
+        return None
+    return Session(
+        backend=fields[1], session_id=fields[0], cwd=fields[2],
+        title="", created=None, last_active=None, transcript_path=fields[3],
+    )
 
 
 def _prompt_choose(sessions, rows) -> Session | None:
@@ -786,15 +1105,9 @@ def _session_json(s: Session) -> dict:
     }
 
 
-def main(argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
-    if argv and argv[0] == "_preview":  # fzf preview helper, not user-facing
-        return cmd_preview(argv[1] if len(argv) > 1 else "")
-    parser = argparse.ArgumentParser(
-        prog="ai-sessions",
-        description="Overview and recovery of AI CLI coding sessions.",
-    )
+def _add_scope_args(parser):
+    """Flags that select and shape the session set, shared by the user-facing
+    parser and the picker's internal _rows helper."""
     parser.add_argument("-n", "--limit", type=int, default=20,
                         help="max rows to show (default: 20)")
     parser.add_argument("--here", action="store_true",
@@ -808,15 +1121,39 @@ def main(argv=None):
     parser.add_argument("--everything", action="store_true",
                         help="search: also match tool output "
                              "(command results, file contents)")
+    parser.add_argument("--recent", action="store_true",
+                        help="search: order hits by last activity instead of "
+                             "relevance")
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "_preview":  # fzf preview helper, not user-facing
+        return cmd_preview(argv[1] if len(argv) > 1 else "")
+    if argv and argv[0] == "_rows":  # fzf reload helper, not user-facing
+        return cmd_rows(argv[1:])
+    parser = argparse.ArgumentParser(
+        prog="ai-sessions",
+        description="Overview and recovery of AI CLI coding sessions.",
+    )
+    _add_scope_args(parser)
     parser.add_argument("command", nargs="?", default=None,
                         choices=["list", "pick", "crashed", "search"],
                         help="pick (fzf + resume; default on a terminal), "
                              "list (table; default when piped), "
                              "crashed (sessions open at last shutdown), "
                              "search <query> (full-text search + resume)")
-    parser.add_argument("query", nargs="?",
-                        help="text to search for (search command only)")
+    parser.add_argument("query", nargs="*",
+                        help="terms to search for (search command only); every "
+                             "term must appear, a quoted group matches as a phrase")
     args = parser.parse_args(argv)
+    # a shell-quoted group arrives as one argv element with spaces in it —
+    # re-quote it so parse_query keeps it together as a phrase
+    args.query = " ".join(
+        f'"{part}"' if any(c.isspace() for c in part) else part
+        for part in args.query
+    )
     if args.command is None:
         interactive = sys.stdout.isatty() and not args.json
         args.command = "pick" if interactive else "list"
