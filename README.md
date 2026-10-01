@@ -35,7 +35,18 @@ $ ai-sessions list
 
 - `●` (green) — session is running right now
 - `✗` (yellow) — session was still open when the machine went down or the
-  process died; it never exited cleanly
+  process died; it never exited cleanly. This needs the hook from
+  [Crash detection](#crash-detection); without it a crash is only visible
+  until the next `claude` starts.
+
+`ai-sessions crashed` on a terminal opens the picker on just those sessions,
+so you can reopen them one after another. A crashed session stops being
+flagged once it is resumed and closed normally, after 14 days, or when you
+dismiss it: `ai-sessions dismiss <id>` (any unique id prefix), or
+`ai-sessions dismiss` alone for every crashed session in scope.
+
+Headless sessions (`claude -p` runs by scripts and agents) are left out of
+every listing and search; `--all` brings them back.
 
 Full-text search finds the session where something was discussed — on a
 terminal the results open in the picker, piped they print with snippets:
@@ -61,7 +72,7 @@ recently the session was active. `--recent` restores plain reverse-chronological
 order.
 
 By default search matches conversation text (your prompts, the assistant's
-replies, session titles). Add `--everything` to also match tool output —
+replies, session titles, and what was said inside the session's subagents). Add `--everything` to also match tool output —
 command results and file contents — for "which session touched this
 host/file?" hunts.
 
@@ -119,22 +130,29 @@ that came up short should widen to every session in scope, not stay inside the
 rows on screen. Pressing it with an empty query says so and returns you to the
 picker.
 
-`ask` runs `claude -p` in your home directory with a read-only toolset
-(`Bash,Read,Glob,Grep` — the session has no Write or Edit tool at all), no MCP
-servers, and `--no-session-persistence`, so searching for a session never adds
-a session to the list you are searching. Otherwise it is a plain Claude Code
-session: your model, your `CLAUDE.md`, no prompt surgery. `--model` picks a
+`ask` runs `claude -p` in your home directory with the tools
+`Bash,Read,Glob,Grep`, no MCP servers, and `--no-session-persistence`, so
+searching for a session never adds a session to the list you are searching.
+The session has no Write or Edit tool, but it is **not read-only**: Bash can
+write files, and the transcripts it reads may contain text from web pages and
+mail that try to steer it. It runs in `--permission-mode auto`, so your auto
+mode classifier is what stands between such text and your machine; the prompt
+tells it to stay read-only, which is a request, not a guarantee. Otherwise it
+is a plain Claude Code session: your model, your `CLAUDE.md`, no prompt
+surgery. `--model` picks a
 cheaper model for the search, `--json` prints the answer and hits instead of
 opening the picker, and `AI_SESSIONS_ASK_TIMEOUT` (default 600s) bounds it.
 It costs a normal API turn or two — a typical hunt is well under a minute.
 
 ```console
 $ ai-sessions crashed        # only the sessions left open at the last shutdown
+$ ai-sessions dismiss [id]   # stop flagging crashed sessions
 $ ai-sessions search <terms> # find sessions by content, then resume one
 $ ai-sessions ask <question> # let a claude session find it, then resume one
 $ ai-sessions --here         # only sessions under the current directory
 $ ai-sessions --project ~/work/my-project
 $ ai-sessions -n 50          # show more rows
+$ ai-sessions --all          # include headless claude -p sessions
 $ ai-sessions --json         # machine-readable output (full session ids, ISO timestamps)
 ```
 
@@ -145,9 +163,15 @@ working directory and execs the backend's resume command
 
 Inside the picker, **Alt-Enter** (or **Ctrl-G**) hands your typed query to
 `ask` (see above) when the ranked hits miss, and **Ctrl-/** toggles a preview
-pane showing the highlighted session's conversation — your prompts and the assistant's replies, with tool
-output and metadata filtered out — so you can confirm it's the right session
-before resuming.
+pane showing the highlighted session's conversation (your prompts and the
+assistant's replies, with tool output and metadata filtered out), so you can
+confirm it's the right session before resuming. The preview opens at the
+first message that matches your query, with the terms highlighted, or at the
+last stretch of the conversation when there is no query.
+
+The line under the header says what the list holds: how many sessions, how
+many match, or that nothing matches and Alt-Enter would ask claude. Enter on
+an empty list does nothing, so you can keep editing the query.
 
 Typing runs the same ranked search as `ai-sessions search`, over every
 message rather than the visible row, and the `MATCHES` column and snippets
@@ -185,6 +209,37 @@ zle -N _ai_sessions_picker
 bindkey '\ea' _ai_sessions_picker   # Alt+A (overrides accept-and-hold)
 ```
 
+## Crash detection
+
+Claude Code deletes a dead session's entry from its registry
+(`~/.claude/sessions/`) the next time any `claude` starts, including the
+resume of another crashed session. So `ai-sessions` keeps its own record,
+written by a Claude Code hook. Add it to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "$HOME/.local/bin/ai-sessions _hook", "timeout": 10 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "$HOME/.local/bin/ai-sessions _hook", "timeout": 10 }] }
+    ]
+  }
+}
+```
+
+Merge it into any hooks you already have. Keep it synchronous (no `async`), so
+SessionEnd is recorded before claude exits. The hook prints nothing and never
+fails a session. It records each session that starts (its id, and the pid and
+start time of the claude process) under `~/.local/state/ai-sessions/` and
+removes the record when the session ends cleanly. A record whose process is
+gone is a session that was left open.
+
+Closing a terminal kills claude without a clean SessionEnd, so those sessions
+count as left open too. That is usually what you want after closing a pile of
+terminals; `ai-sessions dismiss` clears the ones you don't.
+
 ## Install
 
 ```console
@@ -194,9 +249,11 @@ $ ./install.sh    # symlinks the script into ~/.local/bin
 ```
 
 Requires Python 3.10+. No third-party Python dependencies. `fzf` is optional
-but recommended for `pick`. Crash detection is most accurate on Linux (it uses
-`/proc` to check process liveness and boot time); on other platforms it
-degrades to a plain pid-liveness check.
+but recommended for `pick`. Then add the hook from
+[Crash detection](#crash-detection). Crash detection needs Linux (it reads
+`/proc` to tell which claude process is which); on other platforms the hook
+records nothing and only Claude Code's own registry is read, with a plain
+pid-liveness check.
 
 ## How it works (claude backend)
 
@@ -210,18 +267,32 @@ of currently running sessions in `~/.claude/sessions/<pid>.json`.
   interaction, so mtime can overstate activity by days.
 - **Title** comes from the session's AI-generated title, falling back to the
   agent name, the last prompt, then the first user message.
-- **Crash detection**: a registry entry whose process is gone (or whose last
-  update predates the current boot) means that session never exited cleanly —
-  it was open when the machine went down. If the transcript shows activity
-  after the stale entry, the session was since resumed and is not flagged.
+- **Running** means a live process holds the session, in Claude Code's
+  registry or in the hook's record. A process is identified by its pid plus
+  its start time (field 22 of `/proc/<pid>/stat`, which Claude Code also
+  records as `procStart`), so a reused pid or a reboot never passes for the
+  old session. The registry's `updatedAt` is not a heartbeat and is not used.
+- **Crashed** means a record says the session was open and its process is
+  gone. The hook's records are the reliable source (see
+  [Crash detection](#crash-detection)); a dead registry entry also counts,
+  for as long as it survives. Sessions with no activity for 14 days are not
+  flagged, and their records are pruned when the next session starts.
 - Only bounded head/tail reads are performed per transcript, so listing stays
   fast even with multi-hundred-MB transcripts.
-- **Search** needs no index: one `grep -liF` pass per term narrows to the
-  candidate transcripts and doubles as the document frequency behind the
-  IDF weights, so rare terms outrank common ones. The candidates are then
-  streamed line by line to match only conversation text (or everything, with
-  `--everything`) and scored. Matching is case-insensitive fixed-string
-  throughout — query case never affects results or ranking.
+- **Search** goes through a text index in `~/.cache/ai-sessions/index/`: one
+  file per transcript holding only the conversation text, one message per
+  line. Building it reads every transcript once (a few seconds per GB);
+  after that a transcript that grew is extended from where indexing stopped,
+  and one that changed in any other way is rebuilt. A session is searched
+  together with its subagents' transcripts. One `grep -liF` pass per term
+  over the index narrows to candidate sessions and doubles as the document
+  frequency behind the IDF weights, so rare terms outrank common ones. The
+  candidates are then read line by line and scored. Matching is
+  case-insensitive fixed-string throughout, so query case never affects
+  results or ranking.
+- **`--everything`** reads the raw transcripts instead, so tool output can
+  match. It matches against the string values in each line, not the JSON
+  around them, so words like `content` or `type` don't hit every line.
 
 - **Ask from the picker** does not use fzf's `become`: fzf's stdout and stderr
   are the pipes the selection is read through, so a command that replaces fzf
@@ -236,13 +307,16 @@ of currently running sessions in `~/.claude/sessions/<pid>.json`.
   actually on disk. The candidate list (uuid, last-active, project, title) is
   handed to it in the prompt so it can shortlist before grepping.
 
-Everything is read-only: `ai-sessions` never writes to the backend's data
-directories. Set `CLAUDE_DIR` to point the claude backend at a different
-directory (useful for testing).
+`ai-sessions` never writes to the backend's data directories. It writes only
+its own: the search index under `~/.cache/ai-sessions/` (or
+`$AI_SESSIONS_CACHE_DIR`), safe to delete at any time, and the hook's records
+under `~/.local/state/ai-sessions/` (or `$AI_SESSIONS_STATE_DIR`). Set
+`CLAUDE_DIR` to point the claude backend at a different directory (useful for
+testing).
 
 ## Adding a backend
 
-Backends subclass `Backend` in the `ai-sessions` script and implement two
+Backends subclass `Backend` in the `ai-sessions` script and implement three
 methods:
 
 ```python
@@ -256,6 +330,12 @@ class MyToolBackend(Backend):
 
     def resume_argv(self, session: Session) -> list[str]:
         return ["mytool", "resume", session.session_id]
+
+    def conversation_line(self, obj: dict) -> tuple[str, str] | None:
+        # ("user" | "assistant" | "title" | "prompt", text) for a transcript
+        # line that is conversation, None for anything else; this is what
+        # search indexes and the preview shows
+        ...
 ```
 
 Then add it to the `BACKENDS` registry. A `BACKEND` column appears in the

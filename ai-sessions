@@ -9,6 +9,11 @@ Backends are pluggable; currently implemented: claude (Claude Code).
 """
 
 import argparse
+try:
+    import fcntl
+except ImportError:  # not POSIX: the index runs unlocked
+    fcntl = None
+import hashlib
 import json
 import math
 import os
@@ -17,10 +22,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +41,14 @@ STATUS_CLOSED = "closed"
 HEAD_BYTES = 8 * 1024
 TAIL_BYTES = 64 * 1024
 TAIL_BYTES_MAX = 1024 * 1024
+
+# A session left open longer ago than this is history, not something to
+# recover: it stops being flagged as crashed.
+CRASH_MAX_AGE = 14 * 86400
+
+# Headless `claude -p` runs (scripts, agents drafting replies). Hidden
+# unless --all, since nobody resumes them by hand.
+HEADLESS_ENTRYPOINTS = ("sdk-cli",)
 
 GREEN = "\033[0;32m"
 YELLOW = "\033[0;33m"
@@ -54,6 +68,8 @@ class Session:
     status: str = STATUS_CLOSED
     has_messages: bool = True
     transcript_path: str = ""
+    entrypoint: str = ""  # how the session was started: cli, sdk-cli, ...
+    subagent_paths: list[str] = field(default_factory=list)
     match_count: int = 0
     snippet: str = ""
     score: float = 0.0
@@ -86,10 +102,15 @@ class Backend:
     def resume_argv(self, session: Session) -> list[str]:
         raise NotImplementedError
 
-    def searchable_text(self, obj: dict) -> str | None:
-        """Conversation text of one transcript line, or None if the line
-        is not conversation (metadata, tool output, ...)."""
+    def conversation_line(self, obj: dict) -> tuple[str, str] | None:
+        """(kind, text) for one transcript line that is conversation, or
+        None for metadata, tool traffic, ... Kind is "user", "assistant",
+        "title" or "prompt" (the last prompt, mirrored as metadata)."""
         raise NotImplementedError
+
+    def searchable_text(self, obj: dict) -> str | None:
+        line = self.conversation_line(obj)
+        return line[1] if line else None
 
 
 # --------------------------------------------------------------------------
@@ -102,6 +123,7 @@ class ClaudeBackend(Backend):
 
     Data layout (Claude Code >= 2.x):
       ~/.claude/projects/<dir>/<uuid>.jsonl   one transcript per session
+      ~/.claude/projects/<dir>/<uuid>/subagents/*.jsonl  its subagents
       ~/.claude/sessions/<pid>.json           registry of running sessions
 
     Transcript notes:
@@ -112,6 +134,12 @@ class ClaudeBackend(Backend):
         *with* a timestamp is the real last activity
       - subagent transcripts live in subdirectories and are excluded by
         only globbing depth-1 UUID-named files
+
+    Registry notes: Claude Code deletes the entries of dead processes
+    whenever a session starts, so a crashed session's entry only survives
+    until the next `claude` (including the resume of another crashed
+    session). It is good for "running", not for "crashed"; that comes from
+    our own ledger, written by the SessionStart/SessionEnd hook (`_hook`).
     """
 
     name = "claude"
@@ -120,6 +148,10 @@ class ClaudeBackend(Backend):
         self.claude_dir = Path(
             os.environ.get("CLAUDE_DIR", "~/.claude")
         ).expanduser()
+
+    @property
+    def ledger_dir(self) -> Path:
+        return _state_dir() / "claude" / "open"
 
     def resume_argv(self, session: Session) -> list[str]:
         return ["claude", "--resume", session.session_id]
@@ -133,7 +165,7 @@ class ClaudeBackend(Backend):
                 continue
             if session:
                 sessions.append(session)
-        self._apply_registry(sessions)
+        self._apply_status(sessions)
         return sessions
 
     def _transcripts(self):
@@ -160,6 +192,7 @@ class ClaudeBackend(Backend):
 
         created = None
         cwd = ""
+        entrypoint = ""
         first_user_text = ""
         meta = {}  # last-seen ai-title / agent-name / last-prompt
         has_messages = False
@@ -170,8 +203,12 @@ class ClaudeBackend(Backend):
                 created = ts
             if not cwd and isinstance(obj.get("cwd"), str):
                 cwd = obj["cwd"]
-            if not first_user_text and obj.get("type") == "user":
-                first_user_text = _message_text(obj)
+            if not entrypoint and isinstance(obj.get("entrypoint"), str):
+                entrypoint = obj["entrypoint"]
+            if obj.get("type") in ("user", "assistant"):
+                has_messages = True
+                if not first_user_text and obj.get("type") == "user":
+                    first_user_text = _message_text(obj)
             self._collect_meta(obj, meta)
 
         last_active = None
@@ -186,8 +223,9 @@ class ClaudeBackend(Backend):
                 has_messages = True
                 if not cwd and isinstance(obj.get("cwd"), str):
                     cwd = obj["cwd"]
+            if not entrypoint and isinstance(obj.get("entrypoint"), str):
+                entrypoint = obj["entrypoint"]
 
-        has_messages = has_messages or created is not None
         if last_active is None:
             # Degenerate transcript (e.g. a title line and nothing else).
             last_active = path.stat().st_mtime
@@ -198,6 +236,13 @@ class ClaudeBackend(Backend):
             or meta.get("last-prompt")
             or first_user_text
         )
+        subagent_dir = path.with_suffix("") / "subagents"
+        try:
+            subagents = sorted(
+                str(p) for p in subagent_dir.iterdir() if p.suffix == ".jsonl"
+            )
+        except OSError:
+            subagents = []
         return Session(
             backend=self.name,
             session_id=session_id,
@@ -207,19 +252,23 @@ class ClaudeBackend(Backend):
             last_active=last_active,
             has_messages=has_messages,
             transcript_path=str(path),
+            entrypoint=entrypoint,
+            subagent_paths=subagents,
         )
 
-    def searchable_text(self, obj: dict) -> str | None:
+    def conversation_line(self, obj: dict) -> tuple[str, str] | None:
         kind = obj.get("type")
         if kind == "ai-title":
-            return obj.get("aiTitle")
+            text = obj.get("aiTitle")
+            return ("title", text) if isinstance(text, str) and text else None
         if kind == "last-prompt":
-            return obj.get("lastPrompt")
+            text = obj.get("lastPrompt")
+            return ("prompt", text) if isinstance(text, str) and text else None
         if kind not in ("user", "assistant"):
             return None
         content = (obj.get("message") or {}).get("content")
         if isinstance(content, str):
-            return content
+            return (kind, content) if content else None
         if isinstance(content, list):
             # Tool results come back as user-role lines with tool_result
             # blocks — that's tool output, not conversation.
@@ -228,7 +277,8 @@ class ClaudeBackend(Backend):
                 for block in content
                 if isinstance(block, dict) and block.get("type") == "text"
             ]
-            return "\n".join(t for t in texts if t) or None
+            text = "\n".join(t for t in texts if isinstance(t, str) and t)
+            return (kind, text) if text else None
         return None
 
     @staticmethod
@@ -269,58 +319,163 @@ class ClaudeBackend(Backend):
                 return parsed
             window = min(window * 4, TAIL_BYTES_MAX)
 
-    def _apply_registry(self, sessions: list[Session]):
-        """Mark sessions as running or crashed from the live-process registry.
+    # -- running / crashed ------------------------------------------------
 
-        Claude Code writes ~/.claude/sessions/<pid>.json while a session is
-        open and removes it on clean exit. An entry whose pid is gone (or
-        whose last update predates the current boot) means the session never
-        shut down cleanly — it was open when the machine went down.
-        """
+    def _registry_entries(self) -> list[dict]:
+        """Claude Code's own registry, normalised. Proves a session is
+        running; a dead entry is a crash only until the next `claude`
+        start sweeps it away."""
         registry_dir = self.claude_dir / "sessions"
-        if not registry_dir.is_dir():
-            return
-        by_id = {s.session_id: s for s in sessions}
+        entries = []
         boot_time = _boot_time()
         for entry_path in sorted(registry_dir.glob("*.json")):
             try:
                 entry = json.loads(entry_path.read_text())
             except (OSError, ValueError):
                 continue
-            session_id = entry.get("sessionId")
-            if not session_id:
+            if not isinstance(entry, dict) or not entry.get("sessionId"):
                 continue
-            pid = entry.get("pid")
             updated_at = (entry.get("updatedAt") or 0) / 1000.0
-            alive = _pid_is_claude(pid) and (
-                boot_time is None or updated_at >= boot_time
-            )
+            entries.append({
+                "session_id": entry["sessionId"],
+                "alive": _pid_alive(
+                    entry.get("pid"), entry.get("procStart"),
+                    since=updated_at, boot_time=boot_time,
+                ),
+                "cwd": entry.get("cwd", ""),
+                "name": entry.get("name", ""),
+                "started": (entry.get("startedAt") or 0) / 1000.0 or None,
+                "entrypoint": entry.get("entrypoint", ""),
+            })
+        return entries
+
+    def _ledger_entries(self) -> list[dict]:
+        """Our own record of open sessions, kept by the hook: written at
+        SessionStart, removed at SessionEnd. An entry whose process is gone
+        is a session that never exited cleanly."""
+        entries = []
+        try:
+            paths = sorted(self.ledger_dir.glob("*.json"))
+        except OSError:
+            return entries
+        for path in paths:
+            try:
+                entry = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(entry, dict) or not entry.get("session_id"):
+                continue
+            entries.append({
+                "session_id": entry["session_id"],
+                "alive": _pid_alive(entry.get("pid"), entry.get("proc_start")),
+                "cwd": entry.get("cwd", ""),
+                "name": "",
+                "started": entry.get("started"),
+                "entrypoint": "",
+            })
+        return entries
+
+    def _apply_status(self, sessions: list[Session]):
+        """Mark sessions running (a live process holds them) or crashed (a
+        record says they were open, and their process is gone)."""
+        by_id = {s.session_id: s for s in sessions}
+        entries = self._registry_entries() + self._ledger_entries()
+        running = {e["session_id"]: e for e in entries if e["alive"]}
+        for session_id, entry in running.items():
             session = by_id.get(session_id)
             if session is None:
-                # Registry entry without a transcript on disk — synthesize a
-                # minimal row so a crashed session is never invisible.
+                # A live session with no transcript yet (nothing said so
+                # far) is still worth showing as running.
                 session = Session(
                     backend=self.name,
                     session_id=session_id,
-                    cwd=entry.get("cwd", ""),
-                    title=_clean_text(entry.get("name", "")),
-                    created=(entry.get("startedAt") or 0) / 1000.0 or None,
-                    last_active=updated_at or None,
+                    cwd=entry["cwd"],
+                    title=_clean_text(entry["name"]),
+                    created=entry["started"],
+                    last_active=entry["started"],
+                    entrypoint=entry["entrypoint"],
                 )
                 sessions.append(session)
                 by_id[session_id] = session
-            if alive:
-                session.status = STATUS_RUNNING
-            elif session.status != STATUS_RUNNING:
-                # If the transcript shows activity clearly after the stale
-                # registry entry, the session was resumed since the crash and
-                # is no longer waiting to be reopened.
-                resumed_since = (
-                    session.last_active is not None
-                    and session.last_active > updated_at + 60
-                )
-                if not resumed_since:
-                    session.status = STATUS_CRASHED
+            session.status = STATUS_RUNNING
+        cutoff = time.time() - CRASH_MAX_AGE
+        for entry in entries:
+            session = by_id.get(entry["session_id"])
+            # no transcript means nothing to resume; too old means history
+            if (session is None or session.status == STATUS_RUNNING
+                    or (session.last_active or 0) < cutoff):
+                continue
+            session.status = STATUS_CRASHED
+
+    def record_hook(self, event: dict):
+        """Keep the ledger from a SessionStart/SessionEnd hook event."""
+        session_id = str(event.get("session_id") or "")
+        if not UUID_RE.match(session_id):
+            return
+        path = self.ledger_dir / f"{session_id}.json"
+        claude = _claude_ancestor()
+        if claude is None:
+            return  # not run by claude (or no /proc): nothing to record
+        pid, proc_start = claude
+        name = event.get("hook_event_name")
+        if name == "SessionEnd":
+            try:
+                entry = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return
+            # the same session may be open in another process too; only
+            # the process that wrote the entry gets to clear it
+            if entry.get("pid") == pid:
+                path.unlink(missing_ok=True)
+            return
+        if name != "SessionStart":
+            return
+        self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "session_id": session_id,
+            "pid": pid,
+            "proc_start": proc_start,
+            "cwd": event.get("cwd") or os.getcwd(),
+            "transcript_path": event.get("transcript_path") or "",
+            "started": time.time(),
+        }
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps(record))
+        os.replace(tmp, path)
+        self._prune_ledger()
+
+    def _prune_ledger(self):
+        """Drop entries of dead processes that are past recovering: no
+        transcript, or nothing happened in it for CRASH_MAX_AGE."""
+        cutoff = time.time() - CRASH_MAX_AGE
+        for path in self.ledger_dir.glob("*.json"):
+            try:
+                entry = json.loads(path.read_text())
+            except (OSError, ValueError):
+                path.unlink(missing_ok=True)
+                continue
+            if _pid_alive(entry.get("pid"), entry.get("proc_start")):
+                continue
+            transcript = entry.get("transcript_path") or ""
+            try:
+                stale = os.path.getmtime(transcript) < cutoff
+            except OSError:
+                stale = True
+            if stale:
+                path.unlink(missing_ok=True)
+
+    def dismiss(self, session_ids: list[str]) -> list[str]:
+        """Forget that these sessions were left open. Returns the ids that
+        had an entry in the ledger."""
+        dismissed = []
+        for session_id in session_ids:
+            path = self.ledger_dir / f"{session_id}.json"
+            try:
+                path.unlink()
+                dismissed.append(session_id)
+            except OSError:
+                continue
+        return dismissed
 
 
 BACKENDS: dict[str, Backend] = {b.name: b for b in [ClaudeBackend()]}
@@ -379,24 +534,98 @@ def _boot_time() -> float | None:
         return None  # non-Linux: degrade to pid-liveness only
 
 
-def _pid_is_claude(pid) -> bool:
+def _proc_stat(pid: int) -> list[bytes] | None:
+    """Fields of /proc/<pid>/stat from field 3 (state) on, or None. The
+    command name (field 2) may hold spaces and parens, so the fields that
+    follow are taken from after its last ')'."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            stat = fh.read()
+    except OSError:
+        return None
+    return stat[stat.rfind(b")") + 2:].split()
+
+
+def _proc_start(pid: int) -> str | None:
+    """Start time of `pid` in clock ticks since boot (stat field 22): with
+    the pid, an identity that survives neither pid reuse nor a reboot."""
+    fields = _proc_stat(pid)
+    return fields[19].decode() if fields and len(fields) > 19 else None
+
+
+def _pid_alive(pid, proc_start=None, since: float = 0.0,
+               boot_time: float | None = None) -> bool:
+    """Whether the process that wrote a record is still running.
+
+    With `proc_start` (Claude Code's `procStart`, or our ledger's) the check
+    is exact. Without it, fall back to "a claude process holds that pid and
+    the record is younger than this boot". Without /proc, a plain liveness
+    check is all there is.
+    """
     if not isinstance(pid, int) or pid <= 0:
+        return False
+    if not os.path.isdir("/proc"):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    current = _proc_start(pid)
+    if current is None:
+        return False
+    if proc_start not in (None, ""):
+        return current == str(proc_start)
+    if boot_time is not None and since < boot_time:
         return False
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
             return b"claude" in fh.read().lower()
     except OSError:
-        # Either the pid is gone, or /proc is unavailable (non-Linux) — in
-        # the latter case fall back to a plain liveness check.
-        if not os.path.isdir("/proc"):
-            try:
-                os.kill(pid, 0)
-                return True
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True
         return False
+
+
+def _claude_ancestor() -> tuple[int, str] | None:
+    """(pid, start time) of the claude process this hook runs under.
+
+    Hooks run through a shell, so the parent is not necessarily claude
+    itself; walk up until a process looks like it (the native binary is
+    named claude, an npm install is node running .../claude-code/cli.js).
+    """
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            return None
+        fields = _proc_stat(pid)
+        if fields is None or len(fields) <= 19:
+            return None
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")[:2]
+        except OSError:
+            return None
+        if any(b"claude" in os.path.basename(a).lower() for a in argv[:1]) or (
+            len(argv) > 1 and b"claude" in argv[1].lower()
+            and os.path.basename(argv[0]) in (b"node", b"bun")
+        ):
+            return pid, fields[19].decode()
+        pid = int(fields[1])
+    return None
+
+
+def _state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or "~/.local/state"
+    return Path(
+        os.environ.get("AI_SESSIONS_STATE_DIR") or Path(base) / "ai-sessions"
+    ).expanduser()
+
+
+def _cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    return Path(
+        os.environ.get("AI_SESSIONS_CACHE_DIR") or Path(base) / "ai-sessions"
+    ).expanduser()
 
 
 def _relative_time(ts: float | None) -> str:
@@ -495,87 +724,314 @@ def query_phrase(query: str) -> str:
 
 
 def _grep_hits(terms: list[str], paths: list[str]) -> dict[str, set[str]]:
-    """Per-term set of transcripts containing it anywhere (a cheap prefilter).
+    """Per-term set of files containing it anywhere (a cheap prefilter).
 
     Doubles as document frequency for the IDF weights. Falls back to "every
     term is in every file" when grep is unavailable, which degrades to a full
     scan with uniform term weights.
     """
+    # a UTF-8 locale, so -i folds å/Å the way str.lower() does
+    env = dict(os.environ, LC_ALL="C.UTF-8")
     hits: dict[str, set[str]] = {}
     for term in terms:
         matched: set[str] = set()
         for chunk in (paths[i:i + 500] for i in range(0, len(paths), 500)):
             try:
                 result = subprocess.run(
-                    ["grep", "-l", "-i", "-F", "--", term, *chunk],
-                    capture_output=True, text=True,
+                    ["grep", "-l", "-i", "-F", "-s", "--", term, *chunk],
+                    capture_output=True, text=True, env=env,
                 )
             except OSError:
                 return {t: set(paths) for t in terms}  # no grep available
-            if result.returncode > 1:
-                return {t: set(paths) for t in terms}  # grep error
+            # 2 means some file could not be read (vanished, permissions);
+            # the matches it did print still hold
             matched.update(p for p in result.stdout.splitlines() if p)
         hits[term] = matched
     return hits
 
 
-def _scan_transcript(path: str, backend: Backend, terms: list[str],
-                     phrase: str, everything: bool) -> dict | None:
-    """Match statistics for one transcript, or None if it's unreadable."""
-    stats = {
-        "matched": set(),      # terms found in conversation text
-        "raw_matched": set(),  # terms found only in tool output
-        "user": 0,            # matching messages I wrote
-        "assistant": 0,       # matching replies
-        "raw": 0,             # matching tool-output lines
-        "phrase": False,
-        "best_hits": (),      # terms of the most on-point single message
-        "snippet_text": "",
-    }
-    best_rank = -1.0
-    try:
-        with open(path, errors="replace") as fh:
+# --------------------------------------------------------------------------
+# Text index
+# --------------------------------------------------------------------------
+#
+# Searching straight through the transcripts means lowercasing a gigabyte of
+# mostly tool output on every keystroke. The index keeps only the
+# conversation text, one message per line as `<kind>\t<text>`, extracted once
+# per transcript and then extended as the transcript grows.
+
+INDEX_KINDS = {"user": "u", "assistant": "a", "title": "t", "prompt": "p"}
+INDEX_SUBAGENT = "s"  # anything said inside a subagent
+_INDEX_MARKERS = tuple(
+    marker
+    for kind in (b"user", b"assistant", b"ai-title", b"last-prompt")
+    for marker in (b'"type":"' + kind + b'"', b'"type": "' + kind + b'"')
+)
+
+
+class TextIndex:
+    """Conversation text of each transcript, kept in step with it.
+
+    `manifest.json` records, per transcript, the size and mtime it was
+    indexed at, the byte offset reached, the 32 bytes before that offset
+    and the size of the text file. A transcript that only grew (the usual
+    case: it is append-only JSONL) is extended from the offset; anything
+    else (the bytes before the offset changed, it shrank) is rebuilt.
+    A run killed half way (fzf kills superseded searches) leaves the
+    manifest behind the text file, so the next run truncates the text back
+    to the recorded size before appending, and nothing is doubled.
+    """
+
+    VERSION = 1
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.manifest_path = root / "manifest.json"
+
+    def update(self, sources: dict[str, tuple["Backend", bool]]) -> dict[str, str]:
+        """Bring the index up to date for `sources` ({transcript path:
+        (backend, is the session's own transcript)}) and return {transcript
+        path: text file} for each one indexed. Anything that cannot be
+        indexed is left out, for the caller to search the raw way."""
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            lock = open(self.root / ".lock", "w")
+        except OSError:
+            return {}
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            manifest = self._load()
+            dirty = self._collect_garbage(manifest)
+            saved = time.monotonic()
+            indexed = {}
+            for src, (backend, is_main) in sources.items():
+                text_path = self.root / (
+                    hashlib.sha1(src.encode()).hexdigest()[:24] + ".txt"
+                )
+                try:
+                    dirty |= self._refresh(src, text_path, backend, is_main,
+                                           manifest)
+                except OSError:
+                    manifest.pop(src, None)
+                    continue
+                indexed[src] = str(text_path)
+                if dirty and time.monotonic() - saved > 2:
+                    # a first build takes a while; keep what is done if
+                    # this run gets killed
+                    self._save(manifest)
+                    dirty, saved = False, time.monotonic()
+            if dirty:
+                self._save(manifest)
+            return indexed
+        except OSError:
+            return {}
+        finally:
+            lock.close()
+
+    def _refresh(self, src: str, text_path: Path, backend: "Backend",
+                 is_main: bool, manifest: dict) -> bool:
+        """Index one transcript if it changed; True if the manifest did."""
+        st = os.stat(src)
+        entry = manifest.get(src)
+        current = isinstance(entry, dict) and entry.get("v") == self.VERSION
+        if (current and entry["size"] == st.st_size
+                and entry["mtime"] == st.st_mtime_ns and text_path.exists()):
+            return False
+        append = (
+            current
+            and st.st_size >= entry["offset"]
+            and text_path.exists()
+            and text_path.stat().st_size >= entry["text_size"]
+            and self._tail(src, entry["offset"]) == entry["tail"]
+        )
+        with open(src, "rb") as fh, \
+                open(text_path, "r+b" if append else "wb") as out:
+            offset = 0
+            if append:
+                offset = entry["offset"]
+                fh.seek(offset)
+                out.truncate(entry["text_size"])
+                out.seek(entry["text_size"])
             for line in fh:
-                low = line.lower()
-                present = [t for t in terms if t in low]
-                if not present:
+                if not line.endswith(b"\n"):
+                    break  # still being written; picked up next time
+                offset += len(line)
+                if not any(m in line for m in _INDEX_MARKERS):
                     continue
                 try:
                     obj = json.loads(line)
                 except ValueError:
-                    obj = None
-                text = backend.searchable_text(obj) if isinstance(obj, dict) else None
-                if not text:
-                    if everything:
-                        stats["raw"] += 1
-                        stats["raw_matched"].update(present)
                     continue
-                low_text = text.lower()
-                hits = [t for t in present if t in low_text]
-                if not hits:
-                    if everything:
-                        stats["raw"] += 1
-                        stats["raw_matched"].update(present)
+                if not isinstance(obj, dict):
                     continue
-                stats["matched"].update(hits)
-                kind = obj.get("type")
-                if kind in ("ai-title", "last-prompt"):
-                    continue  # metadata mirroring the title/prompt: no double count
-                is_user = kind == "user"
-                if is_user:
-                    stats["user"] += 1
+                said = backend.conversation_line(obj)
+                if said is None:
+                    continue
+                kind, text = said
+                if is_main:
+                    code = INDEX_KINDS.get(kind)
+                elif kind in ("user", "assistant"):
+                    code = INDEX_SUBAGENT
                 else:
-                    stats["assistant"] += 1
-                line_phrase = bool(phrase) and phrase in low_text
-                stats["phrase"] = stats["phrase"] or line_phrase
-                rank = len(hits) + (0.5 if line_phrase else 0.0) + (0.2 if is_user else 0.0)
-                if rank > best_rank:
-                    best_rank = rank
-                    stats["best_hits"] = tuple(hits)
-                    stats["snippet_text"] = text
+                    code = None
+                text = " ".join(text.split())
+                if code and text:
+                    out.write(f"{code}\t{text}\n".encode("utf-8", "replace"))
+            text_size = out.tell()
+        manifest[src] = {
+            "v": self.VERSION,
+            "size": st.st_size,
+            "mtime": st.st_mtime_ns,
+            "offset": offset,
+            "tail": self._tail(src, offset),
+            "text_size": text_size,
+            "text": text_path.name,
+        }
+        return True
+
+    @staticmethod
+    def _tail(path: str, offset: int) -> str:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, offset - 32))
+            return fh.read(min(32, offset)).hex()
+
+    def _collect_garbage(self, manifest: dict) -> bool:
+        """Forget transcripts that are gone, and their text."""
+        gone = [src for src in manifest if not os.path.exists(src)]
+        for src in gone:
+            entry = manifest.pop(src)
+            if isinstance(entry, dict) and entry.get("text"):
+                (self.root / entry["text"]).unlink(missing_ok=True)
+        return bool(gone)
+
+    def _load(self) -> dict:
+        try:
+            manifest = json.loads(self.manifest_path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return manifest if isinstance(manifest, dict) else {}
+
+    def _save(self, manifest: dict):
+        tmp = self.manifest_path.with_name(f".manifest.{os.getpid()}")
+        tmp.write_text(json.dumps(manifest))
+        os.replace(tmp, self.manifest_path)
+
+
+# --------------------------------------------------------------------------
+# Scanning and scoring
+# --------------------------------------------------------------------------
+
+
+def _new_stats() -> dict:
+    return {
+        "matched": set(),      # terms found in conversation text
+        "raw_matched": set(),  # terms found only in tool output
+        "user": 0,            # matching messages I wrote
+        "assistant": 0,       # matching replies (and subagent text)
+        "raw": 0,             # matching tool-output lines
+        "phrase": False,
+        "best_rank": -1.0,
+        "best_hits": (),      # terms of the most on-point single message
+        "snippet_text": "",
+    }
+
+
+def _count_message(stats: dict, kind: str, text: str, hits: list[str],
+                   phrase: str):
+    """Fold one conversation message that matched `hits` into `stats`."""
+    stats["matched"].update(hits)
+    if kind in ("t", "p"):
+        return  # metadata mirroring the title/prompt: no double count
+    is_user = kind == "u"
+    stats["user" if is_user else "assistant"] += 1
+    line_phrase = bool(phrase) and phrase in text.lower()
+    stats["phrase"] = stats["phrase"] or line_phrase
+    rank = (len(hits) + (0.5 if line_phrase else 0.0)
+            + (0.2 if is_user else 0.0)
+            - (0.3 if kind == INDEX_SUBAGENT else 0.0))
+    if rank > stats["best_rank"]:
+        stats["best_rank"] = rank
+        stats["best_hits"] = tuple(hits)
+        stats["snippet_text"] = text
+
+
+def _scan_index(path: str, terms: list[str], phrase: str, stats: dict) -> bool:
+    """Scan one index file into `stats`; False if it is unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                kind, _, text = line.rstrip("\n").partition("\t")
+                low = text.lower()
+                hits = [t for t in terms if t in low]
+                if hits:
+                    _count_message(stats, kind, text, hits, phrase)
     except OSError:
-        return None
-    return stats
+        return False
+    return True
+
+
+def _json_strings(value) -> str:
+    """Every string value in a JSON object, joined: what a person could
+    have meant by "this word appears", without the keys (`type`,
+    `content`, ... appear on every line) or encoded blobs."""
+    out: list[str] = []
+
+    def walk(v):
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+        elif isinstance(v, dict):
+            if v.get("type") == "base64":
+                return  # an embedded image or document
+            for key, item in v.items():
+                if key != "signature":  # thinking signatures are base64
+                    walk(item)
+
+    walk(value)
+    return "\n".join(out)
+
+
+def _scan_raw(path: str, backend: "Backend", is_main: bool, terms: list[str],
+              phrase: str, everything: bool, stats: dict) -> bool:
+    """Scan one transcript straight from its JSONL into `stats`: the
+    --everything path, and the fallback when it could not be indexed."""
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                low = line.lower()
+                if not any(t in low for t in terms):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                said = backend.conversation_line(obj)
+                if said is not None:
+                    kind, text = said
+                    text = " ".join(text.split())
+                    hits = [t for t in terms if t in text.lower()]
+                    if hits:
+                        if is_main:
+                            code = INDEX_KINDS.get(kind, "a")
+                        elif kind in ("user", "assistant"):
+                            code = INDEX_SUBAGENT
+                        else:
+                            continue
+                        _count_message(stats, code, text, hits, phrase)
+                        continue
+                if everything:
+                    values = _json_strings(obj).lower()
+                    raw_hits = [t for t in terms if t in values]
+                    if raw_hits:
+                        stats["raw"] += 1
+                        stats["raw_matched"].update(raw_hits)
+    except OSError:
+        return False
+    return True
 
 
 def _recency_bonus(last_active: float | None) -> float:
@@ -614,35 +1070,68 @@ def run_search(sessions: list[Session], terms: list[str], phrase: str,
                ) -> tuple[list[Session], bool]:
     """Rank sessions by how well they match `terms`.
 
+    A session is searched through its own transcript and its subagents'.
+    Without --everything that goes through the text index; with it, the raw
+    transcripts are read so tool output can match too.
+
     Sessions matching every term win; only if none does are partial matches
     shown, and the returned flag says so. Returns (results, relaxed).
     """
-    by_path = {s.transcript_path: s for s in sessions if s.transcript_path}
-    if not by_path or not terms:
+    searchable = [s for s in sessions if s.transcript_path]
+    if not searchable or not terms:
         return [], False
-    paths = list(by_path)
-    hits = _grep_hits(terms, paths)
-    total_docs = len(paths)
+    sources = [
+        (path, s, path == s.transcript_path)
+        for s in searchable
+        for path in [s.transcript_path, *s.subagent_paths]
+    ]
+    indexed = {} if everything else TextIndex(_cache_dir() / "index").update(
+        {path: (BACKENDS[s.backend], is_main) for path, s, is_main in sources}
+    )
+    # file to grep and scan -> (session, is the session's own transcript,
+    # is an index file rather than raw JSONL)
+    files: dict[str, tuple[Session, bool, bool]] = {}
+    for path, s, is_main in sources:
+        if path in indexed:
+            files[indexed[path]] = (s, is_main, True)
+        else:
+            files[path] = (s, is_main, False)
+
+    file_hits = _grep_hits(terms, list(files))
+    hits = {
+        t: {files[f][0].session_id for f in found}
+        for t, found in file_hits.items()
+    }
+    total_docs = len(searchable)
     idf = {
         t: math.log(1 + total_docs / (1 + len(hits.get(t, ()))))
         for t in terms
     }
     strict = set.intersection(*(hits[t] for t in terms))
+    hit_files = set().union(*file_hits.values())
+    files_of: dict[str, list[str]] = {}
+    for f, (s, _, _) in files.items():
+        if f in hit_files:
+            files_of.setdefault(s.session_id, []).append(f)
+    by_id = {s.session_id: s for s in searchable}
 
     scanned: dict[str, dict] = {}
 
     def scan(candidates) -> list[Session]:
         found = []
-        for path in candidates:
-            session = by_path[path]
-            stats = scanned.get(path)
+        for session_id in candidates:
+            session = by_id[session_id]
+            stats = scanned.get(session_id)
             if stats is None:
-                stats = _scan_transcript(
-                    path, BACKENDS[session.backend], terms, phrase, everything
-                )
-                if stats is None:
-                    continue
-                scanned[path] = stats
+                stats = _new_stats()
+                for f in files_of.get(session_id, ()):
+                    _, is_main, is_index = files[f]
+                    if is_index:
+                        _scan_index(f, terms, phrase, stats)
+                    else:
+                        _scan_raw(f, BACKENDS[session.backend], is_main,
+                                  terms, phrase, everything, stats)
+                scanned[session_id] = stats
             matched = stats["matched"] | stats["raw_matched"]
             if not matched:
                 continue
@@ -1025,15 +1514,28 @@ def run_ask_agent(prompt: str, model: str | None = None) -> dict:
 
     started = time.time()
     result = None
-    with AskProgress() as progress:
+    timed_out = threading.Event()
+    # stderr goes to a file, not a pipe: nothing reads a pipe until stdout
+    # ends, and a chatty stderr would fill it and stall both processes
+    errfile = tempfile.TemporaryFile(mode="w+")
+    with AskProgress() as progress, errfile:
         progress.step("starting a claude session…", "»")
         try:
             proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                argv, stdout=subprocess.PIPE, stderr=errfile,
                 text=True, cwd=str(Path.home()),
             )
         except OSError as exc:
             raise AskError(f"could not run claude: {exc}") from exc
+
+        def expire():
+            timed_out.set()
+            proc.kill()
+
+        # a timer, so a session that goes silent is stopped too
+        timer = threading.Timer(ASK_TIMEOUT, expire)
+        timer.daemon = True
+        timer.start()
         try:
             for line in proc.stdout:
                 try:
@@ -1061,17 +1563,18 @@ def run_ask_agent(prompt: str, model: str | None = None) -> dict:
                     progress.note(_result_line(obj))
                 elif kind == "result":
                     result = obj  # close() prints the summary line
-                if time.time() - started > ASK_TIMEOUT:
-                    proc.kill()
-                    raise AskError(f"the search took longer than {ASK_TIMEOUT}s")
         except KeyboardInterrupt:
             proc.kill()
             raise AskError("cancelled") from None
         finally:
+            timer.cancel()
             if proc.poll() is None:
                 proc.wait()
 
-        stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        if timed_out.is_set():
+            raise AskError(f"the search took longer than {ASK_TIMEOUT}s")
+        errfile.seek(0)
+        stderr = errfile.read().strip()
         if result is None:
             detail = stderr.splitlines()[-1] if stderr else "no result was returned"
             raise AskError(f"the search session failed: {detail}")
@@ -1151,6 +1654,9 @@ def gather(args) -> list[Session]:
 
     if not args.json:
         sessions = [s for s in sessions if s.has_messages]
+    if not args.all:
+        sessions = [s for s in sessions
+                    if s.entrypoint not in HEADLESS_ENTRYPOINTS]
     if args.here:
         base = os.getcwd()
         sessions = [
@@ -1218,18 +1724,28 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
     return rows
 
 
-def render_snippet(session: Session, terms: list[str], color: bool, width: int) -> str:
-    snippet = _truncate(session.snippet, width)
-    if not color or not terms:
-        return snippet
-    # highlight every matched term inside the dimmed snippet; longest first so
-    # a term that contains another still highlights as one run
+def _highlight(text: str, terms: list[str], style: str = "") -> str:
+    """`text` in `style`, with every query term lit up. Longest terms first,
+    so a term that contains another still highlights as one run."""
+    if not terms:
+        return f"{style}{text}{NC}" if style else text
     pattern = re.compile(
         "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)),
         re.IGNORECASE,
     )
-    lit = pattern.sub(lambda m: f"{NC}{YELLOW}{m.group(0)}{NC}{DIM}", snippet)
-    return f"{DIM}{lit}{NC}"
+    lit = pattern.sub(lambda m: f"{NC}{YELLOW}{m.group(0)}{NC}{style}", text)
+    return f"{style}{lit}{NC}"
+
+
+def render_snippet(session: Session, terms: list[str], color: bool, width: int) -> str:
+    snippet = _truncate(session.snippet, width)
+    if not color or not terms:
+        return snippet
+    return _highlight(snippet, terms, DIM)
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def cmd_list(args):
@@ -1256,7 +1772,6 @@ def cmd_list(args):
 
 
 def cmd_crashed(args):
-    args.crashed_only = True
     sessions = [s for s in gather(args) if s.status == STATUS_CRASHED]
     if args.json:
         print(json.dumps([_session_json(s) for s in sessions], indent=2))
@@ -1264,30 +1779,82 @@ def cmd_crashed(args):
     if not sessions:
         print("no sessions were left open — nothing to recover")
         return 0
-    color = sys.stdout.isatty()
-    for row in render_rows(sessions, color):
+    if sys.stdout.isatty():
+        # every crashed session is on offer, and typing searches just those
+        args.limit = max(args.limit, len(sessions))
+        rows = render_rows(sessions, color=True)[1:]
+        return choose_and_resume(
+            sessions, rows, _population_label(args, len(sessions)),
+            _scope_argv(args), ask_argv=_ask_argv(args),
+        )
+    for row in render_rows(sessions, color=False):
         print(row)
-    print("\nresume one with: ai-sessions pick")
+    print("\nrun 'ai-sessions crashed' on a terminal to pick one to resume,"
+          " or 'ai-sessions dismiss <id>' to stop flagging it")
+    return 0
+
+
+def cmd_dismiss(args, ids: list[str]):
+    """Stop flagging sessions as left open: the named ones (any unique id
+    prefix), or every crashed session in scope."""
+    crashed = [s for s in gather(args) if s.status == STATUS_CRASHED]
+    if ids:
+        chosen = []
+        for prefix in ids:
+            found = [s for s in crashed if s.session_id.startswith(prefix)]
+            if len(found) != 1:
+                what = "matches no" if not found else "matches more than one"
+                print(f"error: {prefix!r} {what} crashed session",
+                      file=sys.stderr)
+                return 1
+            chosen.append(found[0])
+    else:
+        chosen = crashed
+    if not chosen:
+        print("no sessions were left open, nothing to dismiss")
+        return 0
+    by_backend: dict[str, list[Session]] = {}
+    for s in chosen:
+        by_backend.setdefault(s.backend, []).append(s)
+    for name, sessions in by_backend.items():
+        backend = BACKENDS[name]
+        done = set(backend.dismiss([s.session_id for s in sessions])
+                   if isinstance(backend, ClaudeBackend) else [])
+        for s in sessions:
+            if s.session_id in done:
+                print(f"dismissed {s.session_id[:8]}  {s.title or '(no title)'}")
+            else:
+                print(f"{s.session_id[:8]} is flagged from Claude Code's own"
+                      " registry, which clears when claude next starts")
     return 0
 
 
 PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+PREVIEW_TAIL_MESSAGES = 30
 
 
-def cmd_preview(path: str) -> int:
-    """Render one transcript as a readable conversation (fzf preview pane)."""
+def cmd_preview(path: str, query: str = "") -> int:
+    """Render one transcript as a readable conversation (fzf preview pane).
+
+    The pane shows its top, so it starts where the interest is: at the
+    first message that matches the query, or else at the last stretch of
+    the conversation, which is what tells sessions apart.
+    """
     if not path or path == "-" or not os.path.isfile(path):
         print("(no transcript on disk)")
         return 0
     backend = BACKENDS["claude"]
-    header_done = False
+    terms = parse_query(query)
+    header = ""
+    truncated = False
+    messages: list[tuple[str, str]] = []
     try:
         size = os.path.getsize(path)
         with open(path, errors="replace") as fh:
             if size > PREVIEW_MAX_BYTES:
                 fh.seek(size - PREVIEW_MAX_BYTES)
                 fh.readline()  # drop partial line
-                print(f"{DIM}… earlier conversation truncated …{NC}\n")
+                truncated = True
             for line in fh:
                 try:
                     obj = json.loads(line)
@@ -1295,36 +1862,63 @@ def cmd_preview(path: str) -> int:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                kind = obj.get("type")
-                if kind not in ("user", "assistant"):
+                said = backend.conversation_line(obj)
+                if said is None or said[0] not in ("user", "assistant"):
                     continue
-                text = backend.searchable_text(obj)
-                if not text or not text.strip():
+                text = said[1].strip()
+                if not text:
                     continue
-                if not header_done:
-                    cwd = obj.get("cwd", "")
-                    ts = obj.get("timestamp", "")[:16].replace("T", " ")
-                    print(f"{DIM}{_short_path(cwd, 60)}   started {ts}{NC}\n")
-                    header_done = True
-                text = text.strip()
-                if kind == "user":
-                    print(f"{GREEN}{BOLD}❯ {text}{NC}")
-                else:
-                    print(text)
-                print()
+                if not header:
+                    cwd = obj.get("cwd") or ""
+                    ts = str(obj.get("timestamp") or "")[:16].replace("T", " ")
+                    # a truncated read starts mid-session, not at its start
+                    since = "from" if truncated else "started"
+                    header = f"{_short_path(str(cwd), 60)}   {since} {ts}"
+                messages.append((said[0], text))
     except OSError:
         print("(transcript unreadable)")
+        return 0
+    if not messages:
+        print("(no conversation)")
+        return 0
+
+    start = max(0, len(messages) - PREVIEW_TAIL_MESSAGES)
+    if terms:
+        first = next(
+            (i for i, (_, text) in enumerate(messages)
+             if any(t in text.lower() for t in terms)),
+            None,
+        )
+        if first is not None:
+            start = max(0, first - 1)  # with the message it answers
+    print(f"{DIM}{header}{NC}\n")
+    if start or truncated:
+        earlier = _plural(start, "earlier message") if start else "earlier messages"
+        print(f"{DIM}… {earlier}"
+              f"{' (and more before that)' if start and truncated else ''} …{NC}\n")
+    for kind, text in messages[start:]:
+        if kind == "user":
+            print(_highlight(f"❯ {text}", terms, GREEN + BOLD))
+        else:
+            print(_highlight(text, terms))
+        print()
     return 0
 
 
 def choose_and_resume(sessions: list[Session], rows: list[str],
+                      status: str = "",
                       reload_argv: list[str] | None = None,
                       query: str = "",
                       ask_argv: list[str] | None = None) -> int:
-    chosen = (_fzf_choose(sessions, rows, reload_argv, query, ask_argv)
-              or _prompt_choose(sessions, rows))
-    if chosen is None:
-        return 1
+    if shutil.which("fzf"):
+        chosen = _fzf_choose(sessions, rows, status, reload_argv, query,
+                             ask_argv)
+        if chosen is None:
+            return 0  # cancelled
+    else:
+        chosen = _prompt_choose(sessions, rows)
+        if chosen is None:
+            return 1
     backend = BACKENDS[chosen.backend]
     cwd = chosen.cwd if chosen.cwd and os.path.isdir(chosen.cwd) else str(Path.home())
     os.chdir(cwd)
@@ -1336,16 +1930,42 @@ def choose_and_resume(sessions: list[Session], rows: list[str],
         return 1
 
 
+def _population_label(args, n: int, window: bool = False) -> str:
+    """What the picker holds, for its status line."""
+    if getattr(args, "crashed_only", False):
+        what = f"{_plural(n, 'session')} left open when the machine went down"
+    elif window:
+        what = f"{n} most recent sessions"
+    else:
+        what = _plural(n, "session")
+    if args.project:
+        what += f" under {_short_path(str(Path(args.project).expanduser()), 40)}"
+    elif args.here:
+        what += f" under {_short_path(os.getcwd(), 40)}"
+    return what
+
+
+def _match_label(results: list[Session], terms: list[str], relaxed: bool) -> str:
+    """The picker's status line for a search."""
+    if not results:
+        return "no session matches · alt-enter asks claude"
+    label = f"{_plural(len(results), 'session')} match"
+    if relaxed:
+        label += (f" · none mentions all {len(terms)} terms,"
+                  " showing the best partial matches")
+    return label
+
+
 def cmd_pick(args):
     sessions = gather(args)
-    if args.crashed_only:
-        sessions = [s for s in sessions if s.status == STATUS_CRASHED]
     sessions = sessions[: args.limit]
     if not sessions:
         print("no sessions found", file=sys.stderr)
         return 1
     rows = render_rows(sessions, color=True)[1:]  # skip header
-    return choose_and_resume(sessions, rows, _scope_argv(args, window=True),
+    return choose_and_resume(sessions, rows,
+                             _population_label(args, len(sessions), window=True),
+                             _scope_argv(args, window=True),
                              ask_argv=_ask_argv(args))
 
 
@@ -1364,6 +1984,8 @@ def _scope_argv(args, window: bool = False) -> list[str]:
         argv += ["--project", args.project]
     if args.backend:
         argv += ["--backend", args.backend]
+    if args.all:
+        argv.append("--all")
     if args.everything:
         argv.append("--everything")
     if args.recent:
@@ -1388,6 +2010,8 @@ def _ask_argv(args) -> list[str]:
         argv += ["--project", args.project]
     if args.backend:
         argv += ["--backend", args.backend]
+    if args.all:
+        argv.append("--all")
     if getattr(args, "model", None):
         argv += ["--model", args.model]
     return argv
@@ -1417,10 +2041,12 @@ def cmd_rows(argv: list[str]) -> int:
     terms = parse_query(query)
     if len(query) < 2 or not terms:
         # a single character matches nearly everything; not worth a scan
-        print(_feed(sessions, render_rows(sessions, color=True)[1:]))
+        shown = sessions[: args.limit]
+        label = _population_label(args, len(shown), window=args.window)
+        print(_feed(shown, render_rows(shown, color=True)[1:], label))
         return 0
 
-    results, _ = run_search(
+    results, relaxed = run_search(
         sessions, terms, query_phrase(query), args.everything, args.recent
     )
     # content search never looks at the project path, but filtering the
@@ -1442,7 +2068,7 @@ def cmd_rows(argv: list[str]) -> int:
         row + "  " + render_snippet(s, terms, color=True, width=60)
         for row, s in zip(rows, results)
     ]
-    print(_feed(results, rows))
+    print(_feed(results, rows, _match_label(results, terms, relaxed)))
     return 0
 
 
@@ -1474,11 +2100,6 @@ def cmd_search(args):
         return 1
     results = results[: args.limit]
     color = sys.stdout.isatty()
-    note = ""
-    if relaxed:
-        note = (f"no session mentions all {len(terms)} terms"
-                " — showing the best partial matches;"
-                " alt-enter hands the hunt to claude")
 
     if color:
         rows = render_rows(results, color=True, show_matches=True)[1:]
@@ -1486,14 +2107,15 @@ def cmd_search(args):
             row + "  " + render_snippet(s, terms, color=True, width=60)
             for row, s in zip(rows, results)
         ]
-        if note:
-            print(f"{YELLOW}{note}{NC}")
         # seed the picker with this query so editing it re-searches
-        return choose_and_resume(results, rows, _scope_argv(args), args.query,
+        return choose_and_resume(results, rows,
+                                 _match_label(results, terms, relaxed),
+                                 _scope_argv(args), args.query,
                                  ask_argv=_ask_argv(args))
 
-    if note:
-        print(note)
+    if relaxed:
+        print(f"no session mentions all {len(terms)} terms"
+              " — showing the best partial matches")
     rows = render_rows(results, color, show_matches=True)
     print(rows[0])
     for row, s in zip(rows[1:], results):
@@ -1554,7 +2176,10 @@ def cmd_ask(args):
         ]
         # no live search over these rows: the set *is* claude's answer. Asking
         # again (alt-enter) re-runs the hunt with a reworded question.
-        return choose_and_resume(results, rows, ask_argv=_ask_argv(args))
+        return choose_and_resume(
+            results, rows, f"claude's {_plural(len(results), 'pick')}",
+            ask_argv=_ask_argv(args),
+        )
     rows = render_rows(results, color, show_matches=True)
     print(rows[0])
     for row, s in zip(rows[1:], results):
@@ -1563,16 +2188,23 @@ def cmd_ask(args):
     return 0
 
 
-def _feed(sessions, rows) -> str:
-    """fzf input: the fields needed to resume or preview, then the rendered
-    row — the only visible part. Rows never contain tabs (titles go through
-    _clean_text), so tab is a safe delimiter.
+def _feed(sessions, rows, status: str) -> str:
+    """fzf input: a status line (fzf's --header-lines=1 keeps it out of the
+    selectable rows), then per session the fields needed to resume or
+    preview and the rendered row — the only visible part. Rows never
+    contain tabs (titles go through _clean_text), so tab is a safe
+    delimiter.
+
+    The status line is always there, so an empty result is an empty list
+    rather than one blank, selectable row.
     """
-    return "\n".join(
+    lines = [f"-\t-\t-\t-\t{DIM}{status}{NC}"]
+    lines += [
         f"{s.session_id}\t{s.backend}\t{s.cwd or ''}\t"
         f"{s.transcript_path or '-'}\t{row}"
         for s, row in zip(sessions, rows)
-    )
+    ]
+    return "\n".join(lines)
 
 
 # alt-enter is the key; ctrl-g is the same thing for terminals that swallow it
@@ -1599,18 +2231,22 @@ def _exec_ask(ask_argv: list[str], question: str) -> None:
              [sys.executable, script, "ask", *ask_argv, "--", question])
 
 
-def _fzf_choose(sessions, rows, reload_argv=None, query="",
+def _fzf_choose(sessions, rows, status="", reload_argv=None, query="",
                 ask_argv=None) -> Session | None:
-    if not shutil.which("fzf"):
-        return None
+    """Run the picker; the chosen session, or None if it was cancelled."""
     script = shlex.quote(os.path.abspath(sys.argv[0]))
     argv = [
         "fzf", "--ansi", "--delimiter=\t", "--with-nth=5..",
+        "--header-lines=1",
         "--height=~50%", "--reverse", "--no-sort",
         "--prompt=session> ",
-        "--preview", f"{script} _preview {{4}}",
+        "--preview", f"{script} _preview {{4}} {{q}}",
         "--preview-window", "right,60%,wrap,hidden",
         "--bind", "ctrl-/:toggle-preview",
+        # enter over an empty list would quit (accept-non-empty too, when
+        # the list has no items at all); stay and let the query change
+        "--bind",
+        'enter:transform:[ "$FZF_MATCH_COUNT" -gt 0 ] && echo accept || true',
     ]
     keys = ["ctrl-/ preview", "enter resume", "esc quit"]
     prefix = ""
@@ -1633,18 +2269,21 @@ def _fzf_choose(sessions, rows, reload_argv=None, query="",
             f"change:reload:sleep 0.15; {script} _rows {flags} -- {{q}} || true",
             "--query", query,
         ]
-        scope = (f"these {len(sessions)} sessions" if "--window" in reload_argv
-                 else "every session")
+        narrowed = "--window" in reload_argv or "--crashed-only" in reload_argv
+        scope = f"these {len(sessions)} sessions" if narrowed else "every session"
         prefix = f"type to search {scope} · "
     argv += ["--header", prefix + " · ".join(keys)]
     try:
         result = subprocess.run(
-            argv, input=_feed(sessions, rows), capture_output=True, text=True,
+            argv, input=_feed(sessions, rows, status),
+            capture_output=True, text=True,
         )
     except OSError:
+        return _prompt_choose(sessions, rows)
+    # 0: something was picked. 1: no match, which still carries an ask key
+    # pressed over an empty list. 130 (esc, ctrl-c) and 2 (error): cancelled.
+    if result.returncode not in (0, 1):
         return None
-    if result.returncode != 0 or not result.stdout.strip():
-        sys.exit(0)  # cancelled
     lines = result.stdout.split("\n")
     if ask_argv is not None:
         # --print-query --expect prints the query, then the key pressed (empty
@@ -1709,6 +2348,9 @@ def _add_scope_args(parser):
                         help="only sessions under PATH")
     parser.add_argument("--backend", choices=sorted(BACKENDS),
                         help="only this backend")
+    parser.add_argument("--all", action="store_true",
+                        help="include headless sessions (claude -p runs by "
+                             "scripts and agents)")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable output")
     parser.add_argument("--everything", action="store_true",
@@ -1722,37 +2364,58 @@ def _add_scope_args(parser):
                              "(default: your Claude Code default)")
 
 
+def cmd_hook() -> int:
+    """Claude Code SessionStart/SessionEnd hook: keep the ledger of open
+    sessions. Never fails and never prints, since SessionStart output would
+    be added to the session's context."""
+    try:
+        event = json.load(sys.stdin)
+        backend = BACKENDS.get("claude")
+        if isinstance(event, dict) and isinstance(backend, ClaudeBackend):
+            backend.record_hook(event)
+    except Exception:
+        pass
+    return 0
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     if argv and argv[0] == "_preview":  # fzf preview helper, not user-facing
-        return cmd_preview(argv[1] if len(argv) > 1 else "")
+        return cmd_preview(argv[1] if len(argv) > 1 else "",
+                           " ".join(argv[2:]))
     if argv and argv[0] == "_rows":  # fzf reload helper, not user-facing
         return cmd_rows(argv[1:])
+    if argv and argv[0] == "_hook":  # Claude Code hook, not user-facing
+        return cmd_hook()
     parser = argparse.ArgumentParser(
         prog="ai-sessions",
         description="Overview and recovery of AI CLI coding sessions.",
     )
     _add_scope_args(parser)
     parser.add_argument("command", nargs="?", default=None,
-                        choices=["list", "pick", "crashed", "search", "ask"],
+                        choices=["list", "pick", "crashed", "search", "ask",
+                                 "dismiss"],
                         help="pick (fzf + resume; default on a terminal), "
                              "list (table; default when piped), "
                              "crashed (sessions open at last shutdown), "
                              "search <query> (full-text search + resume), "
-                             "ask <question> (let claude find the session)")
+                             "ask <question> (let claude find the session), "
+                             "dismiss [id...] (stop flagging crashed sessions)")
     parser.add_argument("query", nargs="*",
-                        help="terms to search for (search), or a question in "
-                             "plain words (ask); every search term must appear, "
-                             "a quoted group matches as a phrase")
+                        help="terms to search for (search), a question in "
+                             "plain words (ask), or session ids (dismiss); "
+                             "every search term must appear, a quoted group "
+                             "matches as a phrase")
     args = parser.parse_args(argv)
+    words = list(args.query)
     # `ask` takes the words as written — it is a question, not a term list
-    args.question = " ".join(args.query)
+    args.question = " ".join(words)
     # a shell-quoted group arrives as one argv element with spaces in it —
     # re-quote it so parse_query keeps it together as a phrase
     args.query = " ".join(
         f'"{part}"' if any(c.isspace() for c in part) else part
-        for part in args.query
+        for part in words
     )
     if args.command is None:
         interactive = sys.stdout.isatty() and not args.json
@@ -1762,7 +2425,7 @@ def main(argv=None):
     if args.command == "ask" and not args.question:
         parser.error("ask requires a question, e.g.: ai-sessions ask "
                      "\"where did I sort out the cert that keeps expiring\"")
-    if args.command not in ("search", "ask") and args.query:
+    if args.command not in ("search", "ask", "dismiss") and args.query:
         parser.error(f"unexpected argument {args.query!r} "
                      f"(did you mean: ai-sessions search {args.query}?)")
     args.crashed_only = args.command == "crashed"
@@ -1775,6 +2438,8 @@ def main(argv=None):
         return cmd_search(args)
     if args.command == "ask":
         return cmd_ask(args)
+    if args.command == "dismiss":
+        return cmd_dismiss(args, words)
     return cmd_list(args)
 
 

@@ -18,3 +18,5 @@ chmod +x "$SCRIPT_DIR/ai-sessions"
 echo "  Linked $BIN_LINK -> $SCRIPT_DIR/ai-sessions"
 
 echo "Done! Make sure ~/.local/bin is on your PATH."
+echo "For crash detection, add the SessionStart/SessionEnd hook to"
+echo "~/.claude/settings.json: see \"Crash detection\" in README.md."
