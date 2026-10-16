@@ -50,6 +50,10 @@ CRASH_MAX_AGE = 14 * 86400
 # unless --all, since nobody resumes them by hand.
 HEADLESS_ENTRYPOINTS = ("sdk-cli",)
 
+SORT_ACTIVE = "active"
+SORT_CLOSED = "closed"
+SORT_KEY = "ctrl-s"  # flips the picker between the two orders
+
 GREEN = "\033[0;32m"
 YELLOW = "\033[0;33m"
 DIM = "\033[2m"
@@ -66,6 +70,8 @@ class Session:
     created: float | None  # epoch seconds
     last_active: float | None
     status: str = STATUS_CLOSED
+    closed: float | None = None  # when it ended; None while running
+    closed_exact: bool = False   # recorded by the hook, not estimated
     has_messages: bool = True
     transcript_path: str = ""
     entrypoint: str = ""  # how the session was started: cli, sdk-cli, ...
@@ -152,6 +158,10 @@ class ClaudeBackend(Backend):
     @property
     def ledger_dir(self) -> Path:
         return _state_dir() / "claude" / "open"
+
+    @property
+    def closed_dir(self) -> Path:
+        return _state_dir() / "claude" / "closed"
 
     def resume_argv(self, session: Session) -> list[str]:
         return ["claude", "--resume", session.session_id]
@@ -406,6 +416,32 @@ class ClaudeBackend(Backend):
                     or (session.last_active or 0) < cutoff):
                 continue
             session.status = STATUS_CRASHED
+        self._apply_closed(sessions)
+
+    def _apply_closed(self, sessions: list[Session]):
+        """When each session ended: the time the SessionEnd hook recorded,
+        or, without a record (killed, crashed, older than the hook), its
+        last activity as an estimate."""
+        ended = {}
+        try:
+            paths = list(self.closed_dir.glob("*.json"))
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                entry = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(entry, dict) and isinstance(entry.get("ended"), (int, float)):
+                ended[path.stem] = float(entry["ended"])
+        for session in sessions:
+            if session.status == STATUS_RUNNING:
+                session.closed, session.closed_exact = None, False
+            elif session.session_id in ended and session.status != STATUS_CRASHED:
+                session.closed = ended[session.session_id]
+                session.closed_exact = True
+            else:
+                session.closed, session.closed_exact = session.last_active, False
 
     def record_hook(self, event: dict):
         """Keep the ledger from a SessionStart/SessionEnd hook event."""
@@ -413,6 +449,7 @@ class ClaudeBackend(Backend):
         if not UUID_RE.match(session_id):
             return
         path = self.ledger_dir / f"{session_id}.json"
+        closed_path = self.closed_dir / f"{session_id}.json"
         claude = _claude_ancestor()
         if claude is None:
             return  # not run by claude (or no /proc): nothing to record
@@ -421,27 +458,33 @@ class ClaudeBackend(Backend):
         if name == "SessionEnd":
             try:
                 entry = json.loads(path.read_text())
+            except FileNotFoundError:
+                entry = None  # opened before the hook was installed
             except (OSError, ValueError):
                 return
             # the same session may be open in another process too; only
             # the process that wrote the entry gets to clear it
-            if entry.get("pid") == pid:
-                path.unlink(missing_ok=True)
+            if entry is not None and entry.get("pid") != pid:
+                return
+            _write_json(closed_path, {
+                "session_id": session_id,
+                "ended": time.time(),
+                "reason": str(event.get("reason") or ""),
+                "transcript_path": event.get("transcript_path") or "",
+            })
+            path.unlink(missing_ok=True)
             return
         if name != "SessionStart":
             return
-        self.ledger_dir.mkdir(parents=True, exist_ok=True)
-        record = {
+        closed_path.unlink(missing_ok=True)  # open again
+        _write_json(path, {
             "session_id": session_id,
             "pid": pid,
             "proc_start": proc_start,
             "cwd": event.get("cwd") or os.getcwd(),
             "transcript_path": event.get("transcript_path") or "",
             "started": time.time(),
-        }
-        tmp = path.with_name(f".{path.name}.{os.getpid()}")
-        tmp.write_text(json.dumps(record))
-        os.replace(tmp, path)
+        })
         self._prune_ledger()
 
     def _prune_ledger(self):
@@ -462,6 +505,15 @@ class ClaudeBackend(Backend):
             except OSError:
                 stale = True
             if stale:
+                path.unlink(missing_ok=True)
+        # a close time is kept for as long as there is a session to show it on
+        for path in self.closed_dir.glob("*.json"):
+            try:
+                entry = json.loads(path.read_text())
+                transcript = entry.get("transcript_path") or ""
+            except (OSError, ValueError, AttributeError):
+                transcript = ""
+            if not transcript or not os.path.exists(transcript):
                 path.unlink(missing_ok=True)
 
     def dismiss(self, session_ids: list[str]) -> list[str]:
@@ -484,6 +536,14 @@ BACKENDS: dict[str, Backend] = {b.name: b for b in [ClaudeBackend()]}
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _write_json(path: Path, record: dict):
+    """Write `record` to `path` atomically, creating the directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(record))
+    os.replace(tmp, path)
 
 
 def _parse_lines(lines: list[str]) -> list[dict]:
@@ -1067,7 +1127,7 @@ def _score(stats: dict, session: Session, terms: list[str],
 
 def run_search(sessions: list[Session], terms: list[str], phrase: str,
                everything: bool, recent_first: bool = False,
-               ) -> tuple[list[Session], bool]:
+               sort: str = SORT_ACTIVE) -> tuple[list[Session], bool]:
     """Rank sessions by how well they match `terms`.
 
     A session is searched through its own transcript and its subagents'.
@@ -1153,7 +1213,7 @@ def run_search(sessions: list[Session], terms: list[str], phrase: str,
         relaxed = len(terms) > 1 and bool(results)
 
     if recent_first:
-        results.sort(key=lambda s: s.last_active or 0, reverse=True)
+        _sort_sessions(results, sort)
     else:
         results.sort(key=lambda s: (s.score, s.last_active or 0), reverse=True)
     return results, relaxed
@@ -1669,8 +1729,18 @@ def gather(args) -> list[Session]:
             s for s in sessions
             if s.cwd == base or s.cwd.startswith(base + os.sep)
         ]
-    sessions.sort(key=lambda s: s.last_active or 0, reverse=True)
+    _sort_sessions(sessions, getattr(args, "sort", SORT_ACTIVE))
     return sessions
+
+
+def _sort_sessions(sessions: list[Session], sort: str):
+    """Newest first by last activity or by close time. Running sessions
+    have no close time, so in close order they go last."""
+    if sort == SORT_CLOSED:
+        sessions.sort(key=lambda s: (s.closed is not None, s.closed or 0,
+                                     s.last_active or 0), reverse=True)
+    else:
+        sessions.sort(key=lambda s: s.last_active or 0, reverse=True)
 
 
 def render_rows(sessions: list[Session], color: bool, show_matches: bool = False) -> list[str]:
@@ -1684,7 +1754,7 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
     )
     show_backend = len({s.backend for s in sessions}) > 1
     backend_w = 8 if show_backend else 0
-    fixed = (2 + time_w + 2 + project_w + 2 + id_w + 2
+    fixed = (2 + 2 * (time_w + 2) + project_w + 2 + id_w + 2
              + (backend_w + 2 if show_backend else 0)
              + (matches_w + 2 if show_matches else 0))
     title_w = max(20, min(term_width - fixed, 60))
@@ -1695,6 +1765,7 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
     header = (
         "   "
         + "LAST ACTIVE".ljust(time_w + 2)
+        + "CLOSED".ljust(time_w + 2)
         + ("BACKEND".ljust(backend_w + 2) if show_backend else "")
         + "PROJECT".ljust(project_w + 2)
         + "TITLE".ljust(title_w + 2)
@@ -1709,9 +1780,20 @@ def render_rows(sessions: list[Session], color: bool, show_matches: bool = False
             marker = paint("✗", YELLOW)
         else:
             marker = " "
+        if s.closed is None:
+            closed = "open".ljust(time_w + 2)
+        elif s.closed_exact:
+            closed = _relative_time(s.closed).ljust(time_w + 2)
+        else:
+            # no close was recorded: last activity is the best guess
+            # (crashed rows are painted yellow whole, a reset would cut that)
+            closed = ("~" + _relative_time(s.closed)).ljust(time_w + 2)
+            if s.status != STATUS_CRASHED:
+                closed = paint(closed, DIM)
         line = (
             f" {marker} "
             + _relative_time(s.last_active).ljust(time_w + 2)
+            + closed
             + ((s.backend.ljust(backend_w + 2)) if show_backend else "")
             + _short_path(s.cwd or "?", project_w).ljust(project_w + 2)
             + _truncate(s.title or "(no title)", title_w).ljust(title_w + 2)
@@ -1932,12 +2014,17 @@ def choose_and_resume(sessions: list[Session], rows: list[str],
 
 def _population_label(args, n: int, window: bool = False) -> str:
     """What the picker holds, for its status line."""
-    if getattr(args, "crashed_only", False):
+    crashed_only = getattr(args, "crashed_only", False)
+    if crashed_only:
         what = f"{_plural(n, 'session')} left open when the machine went down"
+    elif window and args.sort == SORT_CLOSED:
+        what = f"{n} most recently closed sessions"
     elif window:
         what = f"{n} most recent sessions"
     else:
         what = _plural(n, "session")
+    if args.sort == SORT_CLOSED and (crashed_only or not window):
+        what += ", latest closed first"
     if args.project:
         what += f" under {_short_path(str(Path(args.project).expanduser()), 40)}"
     elif args.here:
@@ -1990,6 +2077,8 @@ def _scope_argv(args, window: bool = False) -> list[str]:
         argv.append("--everything")
     if args.recent:
         argv.append("--recent")
+    if args.sort != SORT_ACTIVE:
+        argv += ["--sort", args.sort]
     if getattr(args, "crashed_only", False):
         argv.append("--crashed-only")
     if window:
@@ -2026,8 +2115,17 @@ def cmd_rows(argv: list[str]) -> int:
     _add_scope_args(parser)
     parser.add_argument("--crashed-only", action="store_true")
     parser.add_argument("--window", action="store_true")
+    parser.add_argument("--sort-file")
     parser.add_argument("query", nargs="*")
     args = parser.parse_args(argv)
+    if args.sort_file:
+        # the picker's live order, flipped by SORT_KEY (see _fzf_choose)
+        try:
+            sort = Path(args.sort_file).read_text().strip()
+        except OSError:
+            sort = ""
+        if sort in (SORT_ACTIVE, SORT_CLOSED):
+            args.sort = sort
     sessions = gather(args)
     if args.crashed_only:
         sessions = [s for s in sessions if s.status == STATUS_CRASHED]
@@ -2047,7 +2145,8 @@ def cmd_rows(argv: list[str]) -> int:
         return 0
 
     results, relaxed = run_search(
-        sessions, terms, query_phrase(query), args.everything, args.recent
+        sessions, terms, query_phrase(query), args.everything, args.recent,
+        args.sort,
     )
     # content search never looks at the project path, but filtering the
     # picker by project used to work — keep it reachable by appending
@@ -2079,7 +2178,8 @@ def cmd_search(args):
         print("search requires a query", file=sys.stderr)
         return 1
     results, relaxed = run_search(
-        sessions, terms, query_phrase(args.query), args.everything, args.recent
+        sessions, terms, query_phrase(args.query), args.everything, args.recent,
+        args.sort,
     )
     if args.json:
         out = []
@@ -2262,13 +2362,25 @@ def _fzf_choose(sessions, rows, status="", reload_argv=None, query="",
         # keystroke to our own ranked search instead of filtering locally.
         # fzf kills a running reload when the query changes again, so the
         # leading sleep lets a superseded query die before it costs a scan.
-        flags = " ".join(shlex.quote(a) for a in reload_argv)
+        # The order lives in a state file rather than in the flags, so that
+        # SORT_KEY can flip it and every later keystroke's reload keeps it.
+        fd, sort_file = tempfile.mkstemp(prefix="ai-sessions-sort-")
+        sort = SORT_ACTIVE
+        if "--sort" in reload_argv:
+            sort = reload_argv[reload_argv.index("--sort") + 1]
+        with os.fdopen(fd, "w") as fh:
+            fh.write(sort)
+        flags = " ".join(shlex.quote(a) for a in
+                         [*reload_argv, "--sort-file", sort_file])
+        rows_cmd = f"{script} _rows {flags} -- {{q}} || true"
         argv += [
             "--disabled",
-            "--bind",
-            f"change:reload:sleep 0.15; {script} _rows {flags} -- {{q}} || true",
+            "--bind", f"change:reload:sleep 0.15; {rows_cmd}",
+            "--bind", (f"{SORT_KEY}:execute-silent({script} _sort_toggle "
+                       f"{shlex.quote(sort_file)})+reload({rows_cmd})"),
             "--query", query,
         ]
+        keys.insert(-1, f"{SORT_KEY} sort active/closed")
         narrowed = "--window" in reload_argv or "--crashed-only" in reload_argv
         scope = f"these {len(sessions)} sessions" if narrowed else "every session"
         prefix = f"type to search {scope} · "
@@ -2280,6 +2392,9 @@ def _fzf_choose(sessions, rows, status="", reload_argv=None, query="",
         )
     except OSError:
         return _prompt_choose(sessions, rows)
+    finally:
+        if reload_argv is not None:
+            Path(sort_file).unlink(missing_ok=True)
     # 0: something was picked. 1: no match, which still carries an ask key
     # pressed over an empty list. 130 (esc, ctrl-c) and 2 (error): cancelled.
     if result.returncode not in (0, 1):
@@ -2333,6 +2448,8 @@ def _session_json(s: Session) -> dict:
         "title": s.title,
         "created": iso(s.created),
         "last_active": iso(s.last_active),
+        "closed": iso(s.closed),
+        "closed_exact": s.closed_exact,
         "status": s.status,
     }
 
@@ -2357,11 +2474,27 @@ def _add_scope_args(parser):
                         help="search: also match tool output "
                              "(command results, file contents)")
     parser.add_argument("--recent", action="store_true",
-                        help="search: order hits by last activity instead of "
+                        help="search: order hits by --sort instead of "
                              "relevance")
+    parser.add_argument("--sort", choices=[SORT_ACTIVE, SORT_CLOSED],
+                        default=SORT_ACTIVE,
+                        help="newest first by last activity (default) or by "
+                             "when the session was closed")
     parser.add_argument("--model", metavar="MODEL",
                         help="ask: model for the search session "
                              "(default: your Claude Code default)")
+
+
+def cmd_sort_toggle(path: str) -> int:
+    """Flip the picker's order in its state file (see _fzf_choose)."""
+    if not path:
+        return 1
+    try:
+        current = Path(path).read_text().strip()
+    except OSError:
+        current = SORT_ACTIVE
+    Path(path).write_text(SORT_ACTIVE if current == SORT_CLOSED else SORT_CLOSED)
+    return 0
 
 
 def cmd_hook() -> int:
@@ -2388,6 +2521,8 @@ def main(argv=None):
         return cmd_rows(argv[1:])
     if argv and argv[0] == "_hook":  # Claude Code hook, not user-facing
         return cmd_hook()
+    if argv and argv[0] == "_sort_toggle":  # fzf key helper, not user-facing
+        return cmd_sort_toggle(argv[1] if len(argv) > 1 else "")
     parser = argparse.ArgumentParser(
         prog="ai-sessions",
         description="Overview and recovery of AI CLI coding sessions.",

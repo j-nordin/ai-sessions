@@ -25,10 +25,10 @@ prints the table instead, same as `ai-sessions list`:
 
 ```console
 $ ai-sessions list
-   LAST ACTIVE  PROJECT               TITLE                            ID
- ● 5m ago      ~/work/my-project     Fix flaky integration test       3f9f264f
- ✗ 2h ago      ~/dotfiles            Refactor install script          6b42ce33
-   1d ago      ~                     Debug docker networking          3ab7bed7
+   LAST ACTIVE  CLOSED       PROJECT               TITLE                            ID
+ ● 5m ago      open         ~/work/my-project     Fix flaky integration test       3f9f264f
+ ✗ 2h ago      ~2h ago      ~/dotfiles            Refactor install script          6b42ce33
+   1d ago      40m ago      ~                     Debug docker networking          3ab7bed7
 
 1 session was open when the machine last went down — 'ai-sessions crashed' to review
 ```
@@ -38,6 +38,14 @@ $ ai-sessions list
   process died; it never exited cleanly. This needs the hook from
   [Crash detection](#crash-detection); without it a crash is only visible
   until the next `claude` starts.
+
+`CLOSED` is when the session ended. An exact time comes from the SessionEnd
+hook (see [Crash detection](#crash-detection)), so a session that sat idle for a
+day and was closed an hour ago reads `1d ago` / `1h ago`. Without a record
+(killed terminal, crash, or closed before the hook was installed) the column
+shows last activity as an estimate, dimmed and prefixed `~`. `--sort closed`
+orders every listing newest close first, with running sessions last, and in
+the picker **Ctrl-S** flips between the two orders without leaving it.
 
 `ai-sessions crashed` on a terminal opens the picker on just those sessions,
 so you can reopen them one after another. A crashed session stops being
@@ -69,7 +77,7 @@ than common ones), whether the whole query appears verbatim, whether a single
 message hits several terms at once, terms in the session title, how often the
 terms recur in your own prompts, and — as a nudge, not the ordering — how
 recently the session was active. `--recent` restores plain reverse-chronological
-order.
+order (by close time with `--sort closed`).
 
 By default search matches conversation text (your prompts, the assistant's
 replies, session titles, and what was said inside the session's subagents). Add `--everything` to also match tool output —
@@ -151,9 +159,11 @@ $ ai-sessions search <terms> # find sessions by content, then resume one
 $ ai-sessions ask <question> # let a claude session find it, then resume one
 $ ai-sessions --here         # only sessions under the current directory
 $ ai-sessions --project ~/work/my-project
+$ ai-sessions --sort closed  # most recently closed first (Ctrl-S in the picker)
 $ ai-sessions -n 50          # show more rows
 $ ai-sessions --all          # include headless claude -p sessions
-$ ai-sessions --json         # machine-readable output (full session ids, ISO timestamps)
+$ ai-sessions --json         # machine-readable output (full session ids, ISO timestamps,
+                             # closed + closed_exact)
 ```
 
 `pick` uses [fzf](https://github.com/junegunn/fzf) if available and falls back
@@ -162,7 +172,9 @@ working directory and execs the backend's resume command
 (e.g. `claude --resume <session-id>`).
 
 Inside the picker, **Alt-Enter** (or **Ctrl-G**) hands your typed query to
-`ask` (see above) when the ranked hits miss, and **Ctrl-/** toggles a preview
+`ask` (see above) when the ranked hits miss, **Ctrl-S** switches between
+last-active and close-time order (the window of `-n` sessions follows it, so
+the plain picker then holds the N most recently closed), and **Ctrl-/** toggles a preview
 pane showing the highlighted session's conversation (your prompts and the
 assistant's replies, with tool output and metadata filtered out), so you can
 confirm it's the right session before resuming. The preview opens at the
@@ -232,9 +244,11 @@ written by a Claude Code hook. Add it to `~/.claude/settings.json`:
 Merge it into any hooks you already have. Keep it synchronous (no `async`), so
 SessionEnd is recorded before claude exits. The hook prints nothing and never
 fails a session. It records each session that starts (its id, and the pid and
-start time of the claude process) under `~/.local/state/ai-sessions/` and
-removes the record when the session ends cleanly. A record whose process is
-gone is a session that was left open.
+start time of the claude process) under `~/.local/state/ai-sessions/claude/open/`
+and removes the record when the session ends cleanly, writing the close time
+and the end reason to `claude/closed/` instead. Starting the session again
+removes its close time. A record whose process is gone is a session that was
+left open.
 
 Closing a terminal kills claude without a clean SessionEnd, so those sessions
 count as left open too. That is usually what you want after closing a pile of
@@ -277,6 +291,9 @@ of currently running sessions in `~/.claude/sessions/<pid>.json`.
   [Crash detection](#crash-detection)); a dead registry entry also counts,
   for as long as it survives. Sessions with no activity for 14 days are not
   flagged, and their records are pruned when the next session starts.
+- **Closed** is the time in `claude/closed/<id>.json`, written by the
+  SessionEnd hook, or the last activity when there is none (marked as an
+  estimate). Close records go when their transcript does.
 - Only bounded head/tail reads are performed per transcript, so listing stays
   fast even with multi-hundred-MB transcripts.
 - **Search** goes through a text index in `~/.cache/ai-sessions/index/`: one
